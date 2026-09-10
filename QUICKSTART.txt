@@ -1,0 +1,64 @@
+YuE2 Console
+============
+
+Generate complete songs locally: lyrics and a style prompt go in, an editable
+melody-and-chord score is written, and that score is rendered to 48 kHz stereo.
+
+
+GETTING STARTED
+---------------
+
+1. Unzip this folder somewhere with about 15 GB free.
+2. Double-click  install.bat
+3. Wait. It sets up Python, downloads PyTorch (~2.5 GB) and offers to fetch the
+   model weights (~7 GB). The console opens in your browser when it is done.
+
+After that, start it any time with  start-console.bat
+
+
+WHAT YOU NEED
+-------------
+
+- Windows 10 or 11
+- An NVIDIA GPU with BF16 support and 24 GB of VRAM or more
+  (RTX 3090, 4090, 5090, A6000 ... a 5090's 32 GB is used automatically)
+- The current NVIDIA driver
+- About 15 GB of disk space
+- Python 3.12 - the installer offers to install it if it is missing
+
+The installer uses the CUDA 12.8 build of PyTorch, which covers everything from
+Ampere through Blackwell, so a 4090 and a 5090 install exactly the same way.
+
+
+FIRST SONG
+----------
+
+1. Type an idea in "Start from an idea" and press Write the brief - a local
+   Ollama model fills in the title, style and lyrics. Skip this and write them
+   yourself if you have no Ollama; everything else works without it.
+2. Press Generate song.
+3. Watch the four stages: the score is written first, then the music tokens,
+   then the audio.
+
+A minute of music takes roughly a minute to render on a 4090.
+
+
+OPTIONAL: THE LYRIC WRITER
+--------------------------
+
+Install Ollama from https://ollama.com and pull any instruct model:
+
+    ollama pull qwen3.5:4b
+
+It appears in the writer dropdown automatically. The writer is unloaded the
+moment it answers so the song model gets the VRAM back.
+
+
+NOTES
+-----
+
+- Songs are written to  outputs\  - audio, score, and everything needed to
+  reproduce the run.
+- The code is Apache 2.0. The model weights are licensed separately under
+  CC BY-NC 4.0, which means non-commercial use. See MODEL_LICENSE.
+- Full documentation: webui\README.md

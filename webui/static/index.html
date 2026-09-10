@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en" data-theme="studio">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>YuE2 Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:opsz,wght@6..96,400;6..96,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" />
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+
+<!-- ---------------------------------------------------------------- topbar -->
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 40 40" width="26" height="26">
+        <path d="M6 30 L6 12 L20 8 L20 26" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="10.5" cy="30" r="4.4" fill="currentColor"/>
+        <circle cx="24.5" cy="26" r="4.4" fill="currentColor"/>
+        <path d="M28 13 L36 13 M28 18 L36 18 M28 23 L36 23" stroke="currentColor" stroke-width="1.1" opacity="0.55"/>
+      </svg>
+    </div>
+    <h1>YuE<span class="two">2</span></h1>
+  </div>
+
+  <div class="engine-chip" id="engineChip">
+    <span class="lamp" id="engineLamp"></span>
+    <div>
+      <strong id="engineState">Checking</strong>
+      <small id="engineDetail">reading hardware</small>
+    </div>
+  </div>
+
+  <dl class="hw-strip" id="hwStats"></dl>
+
+  <div class="spacer"></div>
+
+  <div class="head-actions">
+    <button class="btn ghost small" id="loadExample">Load example</button>
+    <button class="btn ghost small" id="clearForm">Clear</button>
+    <button class="btn ghost small" id="engineToggle">Engine</button>
+  </div>
+</header>
+
+<!-- ---------------------------------------------------------------- engine -->
+<section class="engine-panel is-hidden" id="view-engine">
+  <div class="engine-grid">
+    <div class="card">
+      <h3>Weights</h3>
+      <label class="field"><span class="label">Model</span><input type="text" id="setModel" /></label>
+      <label class="field"><span class="label">Decoder<em>standard for listening, legacy for benchmark parity</em></span>
+        <select id="setVae"><option value="standard">YuE2-Vae (standard)</option><option value="legacy">YuE2-Vae-legacy (benchmark)</option></select>
+      </label>
+      <label class="check"><input type="checkbox" id="setOffline" /> <span>Offline: use only files already downloaded</span></label>
+    </div>
+
+    <div class="card">
+      <h3>Compute</h3>
+      <label class="field"><span class="label">Device</span><input type="text" id="setDevice" placeholder="auto" /></label>
+      <label class="field"><span class="label">Backend</span>
+        <select id="setBackend"><option value="torch">torch (CUDA graphs)</option><option value="torch-eager">torch-eager</option><option value="vllm">vllm (needs the fast extra)</option></select>
+      </label>
+      <label class="field"><span class="label">Quantization</span>
+        <select id="setQuant"><option value="none">none (bf16)</option><option value="fp8">fp8</option></select>
+      </label>
+      <div class="field-row">
+        <label class="field"><span class="label">VRAM budget</span><input type="number" id="setBudget" step="any" /></label>
+        <label class="field"><span class="label">ODE steps</span><input type="number" id="setOde" step="any" /></label>
+      </div>
+      <label class="check"><input type="checkbox" id="setOffload" /> <span>Offload the language model during synthesis</span></label>
+    </div>
+
+    <div class="card wide">
+      <h3>Writer</h3>
+      <p class="hint">A local language model turns a one-line idea into a title, style prompt and
+        lyrics. It is unloaded the moment it answers, so the song model gets the VRAM back.</p>
+
+      <label class="field"><span class="label">Backend</span>
+        <select id="setWriterBackend">
+          <option value="auto">Automatic</option>
+          <option value="llamacpp">llama.cpp (installed here)</option>
+          <option value="ollama">Ollama (installed separately)</option>
+        </select>
+      </label>
+
+      <div class="writer-pane" id="paneLlamacpp">
+        <div class="pane-head">
+          <h4 class="mini">llama.cpp</h4>
+          <span class="pill" id="llamaState">checking</span>
+          <div class="spacer"></div>
+          <button type="button" class="btn ghost small" id="llamaInstall">Install llama.cpp</button>
+        </div>
+        <p class="hint" id="llamaHint">Downloads the prebuilt CUDA build (about 400 MB) into the project
+          folder. Nothing is installed system-wide, and the server runs only while a brief is being written.</p>
+        <label class="field"><span class="label">Model in use</span><select id="setLlamaModel"></select></label>
+        <div class="field-row">
+          <label class="field grow"><span class="label">Also look in <em>your own GGUF folder</em></span>
+            <input type="text" id="writerDir" placeholder="D:\models	ext" /></label>
+          <div class="field reset-cell"><button type="button" class="btn ghost" id="writerDirAdd">Add folder</button></div>
+        </div>
+        <p class="row-hint" id="writerDirs"></p>
+        <div class="model-list" id="llamaCatalog"></div>
+      </div>
+
+      <div class="writer-pane" id="paneOllama">
+        <div class="pane-head">
+          <h4 class="mini">Ollama</h4>
+          <span class="pill" id="ollamaState">checking</span>
+        </div>
+        <label class="field"><span class="label">Address</span><input type="text" id="setOllama" placeholder="http://127.0.0.1:11434" /></label>
+        <label class="field"><span class="label">Model</span><select id="setMuseModel"></select></label>
+        <dl class="kv" id="museCard"></dl>
+      </div>
+
+      <label class="check"><input type="checkbox" id="setMuseFree" /> <span>Unload YuE2 before writing</span></label>
+    </div>
+
+    <div class="card wide">
+      <h3>Cover art</h3>
+      <p class="hint">stable-diffusion.cpp draws a sleeve from the song's own title and style
+        prompt. Like the writer, it is downloaded into the project folder and the process ends
+        with the picture, so it holds no VRAM afterwards.</p>
+      <div class="writer-pane" id="paneArt">
+        <div class="pane-head">
+          <h4 class="mini">stable-diffusion.cpp</h4>
+          <span class="pill" id="artState">checking</span>
+          <div class="spacer"></div>
+          <button type="button" class="btn ghost small" id="artInstall">Install</button>
+        </div>
+        <label class="field"><span class="label">Checkpoint in use</span><select id="setArtModel"></select></label>
+        <label class="check"><input type="checkbox" id="setArtAuto" /> <span>Draw a cover automatically after each song</span></label>
+        <div class="field-row">
+          <label class="field grow"><span class="label">Also look in <em>e.g. your ComfyUI checkpoints</em></span>
+            <input type="text" id="artDir" placeholder="D:\ComfyUI\models\checkpoints" /></label>
+          <div class="field reset-cell"><button type="button" class="btn ghost" id="artDirAdd">Add folder</button></div>
+        </div>
+        <p class="row-hint" id="artDirs"></p>
+        <div class="model-list" id="artCatalog"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Hardware</h3>
+      <dl class="kv" id="hwCard"></dl>
+      <p class="hint" id="outputPath"></p>
+      <div class="card-actions">
+        <button class="btn ghost small" id="freeVram">Free VRAM</button>
+        <button class="btn ghost small" id="preloadBtn">Load model now</button>
+        <button class="btn primary small" id="saveSettings">Save</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------- workspace -->
+<div class="workspace">
+
+  <!-- compose ------------------------------------------------------------ -->
+  <section class="col compose-col" id="view-compose">
+    <div class="col-head">
+      <h2>Compose</h2>
+      <span class="col-note">symbols in, sound out</span>
+    </div>
+
+    <section class="muse" id="muse">
+      <div class="muse-head">
+        <h3>Start from an idea</h3>
+        <span class="muse-tag" id="museTag">local writer</span>
+        <div class="spacer"></div>
+        <select id="museModel" title="Ollama model that writes the brief"></select>
+      </div>
+      <div class="muse-row">
+        <input type="text" id="idea" autocomplete="off"
+               placeholder="a slow song about missing the last train home" />
+        <button type="button" class="btn writer" id="museBtn">
+          <span id="museGlyph" aria-hidden="true">✎</span> <span id="museLabel">Write the brief</span>
+        </button>
+      </div>
+      <div class="muse-row secondary">
+        <label class="field grow">
+          <span class="label">Structure</span>
+          <select id="structure">
+            <option value="simple">Verse · Chorus</option>
+            <option value="bridge" selected>Verse · Chorus · Bridge</option>
+            <option value="prechorus">With a pre-chorus</option>
+            <option value="full">Full arc — intro, pre-chorus, bridge, outro</option>
+          </select>
+        </label>
+      </div>
+      <p class="row-hint" id="structureHint"></p>
+      <div class="muse-foot">
+        <label class="check"><input type="checkbox" id="museFree" checked />
+          <span>Unload YuE2 first, writer straight after — shared VRAM</span></label>
+        <span class="muse-status mono" id="museStatus"></span>
+      </div>
+      <p class="row-hint" id="coverLine"></p>
+    </section>
+
+    <form id="composeForm" class="compose" novalidate>
+      <div class="field-row">
+        <label class="field grow">
+          <span class="label">Title</span>
+          <input type="text" id="title" placeholder="City Lights" autocomplete="off" />
+        </label>
+        <label class="field seedfield">
+          <span class="label">Seed</span>
+          <div class="seed-wrap">
+            <input type="number" id="seed" placeholder="random" step="any" />
+            <button type="button" class="dice" id="rollSeed" title="Roll a new seed" aria-label="Roll a new seed">
+              <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true"><rect x="2.5" y="2.5" width="15" height="15" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="7" r="1.5" fill="currentColor"/><circle cx="13" cy="13" r="1.5" fill="currentColor"/><circle cx="10" cy="10" r="1.5" fill="currentColor"/></svg>
+            </button>
+          </div>
+        </label>
+      </div>
+
+
+      <label class="field">
+        <span class="label">Style prompt <em>language, genre, voice, instruments, tempo</em></span>
+        <textarea id="style" rows="3" placeholder="English, warm piano pop, expressive female voice, acoustic piano, rounded bass and light drums, unhurried phrasing, 88 BPM"></textarea>
+      </label>
+
+      <label class="field">
+        <span class="label">Lyrics <em>section tags on their own line</em></span>
+        <textarea id="lyrics" rows="14" spellcheck="false" placeholder="[Verse]&#10;Neon fades along the lane&#10;Footsteps keep the time of rain&#10;&#10;[Chorus]&#10;Let the day come into view"></textarea>
+      </label>
+
+      <fieldset class="field">
+        <span class="label">Planning mode</span>
+        <div class="modes" id="modes">
+          <label class="mode">
+            <input type="radio" name="cot" value="full" checked />
+            <span class="mode-body">
+              <strong>Full plan</strong>
+              <small>Melody and chords written first, then rendered. Best for new songs.</small>
+            </span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="cot" value="melody" />
+            <span class="mode-body">
+              <strong>Melody only</strong>
+              <small>Melody plan, free accompaniment. Recommended for covers.</small>
+            </span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="cot" value="off" />
+            <span class="mode-body">
+              <strong>Direct</strong>
+              <small>Straight from lyrics and style, no editable score.</small>
+            </span>
+          </label>
+        </div>
+      </fieldset>
+
+      <details class="drawer" id="coverDrawer">
+        <summary><span class="chev" aria-hidden="true"></span> Cover or remix <em class="summary-note">reuse a melody, change the style</em></summary>
+        <div class="drawer-body">
+          <p class="hint">A cover keeps the melody and rebuilds everything around it. Take the score from
+            a finished take, or transcribe a recording, then write a new style prompt and render it in
+            <strong>Melody only</strong> mode.</p>
+
+          <div class="field-row">
+            <label class="field grow">
+              <span class="label">From a take</span>
+              <select id="coverTake"></select>
+            </label>
+            <div class="field reset-cell">
+              <button type="button" class="btn ghost" id="coverFromTake">Use this melody</button>
+            </div>
+          </div>
+
+          <div class="field-row">
+            <label class="field grow">
+              <span class="label">From a recording <em>wav, flac, mp3, m4a, ogg</em></span>
+              <input type="file" id="coverFile" accept=".wav,.flac,.mp3,.m4a,.ogg,.opus,.aac" />
+            </label>
+            <div class="field reset-cell">
+              <button type="button" class="btn ghost" id="coverFromAudio">Transcribe</button>
+            </div>
+          </div>
+
+          <label class="check"><input type="checkbox" id="coverMelodyOnly" checked />
+            <span>Drop chord symbols so the new style can rebuild the harmony</span></label>
+          <p class="row-hint" id="coverStatus"></p>
+        </div>
+      </details>
+
+      <details class="drawer" id="scoreDrawer">
+        <summary><span class="chev" aria-hidden="true"></span> Supply your own score <em class="summary-note">ABC, for covers and edits</em></summary>
+        <div class="drawer-body">
+          <p class="hint">Paste an ABC score to condition the song on a melody you already have. Available in full and melody modes; for covers, use melody mode with a score that carries no chord symbols.</p>
+          <div class="chiprow">
+            <button type="button" class="chip" data-abc="melody">Example melody</button>
+            <button type="button" class="chip" data-abc="score">Example score</button>
+            <button type="button" class="chip" data-abc="jazz">Jazz reharmonization</button>
+            <button type="button" class="chip danger" data-abc="">Remove score</button>
+          </div>
+          <textarea id="abc" rows="8" spellcheck="false" class="mono" placeholder="X:1&#10;L:1/8&#10;M:4/4&#10;K:C"></textarea>
+        </div>
+      </details>
+
+      <details class="drawer" id="advDrawer">
+        <summary><span class="chev" aria-hidden="true"></span> Sampling <em class="summary-note">defaults are tuned</em></summary>
+        <div class="drawer-body">
+          <div class="sampler-grid">
+            <div class="sampler">
+              <h4><span class="dot patina"></span> Score planner</h4>
+              <div class="knobs" data-group="abc"></div>
+            </div>
+            <div class="sampler">
+              <h4><span class="dot amber"></span> Music tokens</h4>
+              <div class="knobs" data-group="semantic"></div>
+            </div>
+          </div>
+          <div class="field-row">
+            <label class="field">
+              <span class="label">Guidance (CFG)<em>blank uses the default</em></span>
+              <input type="number" id="cfg" step="any" placeholder="default" />
+            </label>
+            <div class="field grow reset-cell">
+              <button type="button" class="btn ghost" id="resetSampling">Reset sampling</button>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <div class="submit-bar">
+        <div class="submit-note" id="submitNote">Model loads on the first run and stays resident.</div>
+        <button type="submit" class="btn primary" id="generateBtn">
+          <span class="btn-glyph" aria-hidden="true">▸</span> Generate song
+        </button>
+      </div>
+    </form>
+  </section>
+
+  <!-- take / run --------------------------------------------------------- -->
+  <section class="col take-col" id="view-take">
+    <div class="col-head">
+      <h2 id="takeTitle">Nothing playing</h2>
+      <span class="col-note" id="takeEyebrow">no run yet</span>
+      <div class="spacer"></div>
+      <div class="head-actions" id="takeActions"></div>
+    </div>
+
+    <div class="chain" id="chain" hidden>
+      <div class="chain-head">
+        <span class="run-state" id="runState">Queued</span>
+        <span class="run-clock mono" id="runClock">0:00</span>
+        <button class="btn ghost small" id="cancelRun">Cancel run</button>
+      </div>
+      <ol class="stages" id="stages"></ol>
+      <p class="run-error is-hidden" id="runError"></p>
+    </div>
+
+    <div class="take-empty" id="takeEmpty">
+      <p>Start a song on the left. The run appears here as it happens: the score is written
+        first, then the music tokens, then the audio.</p>
+    </div>
+
+    <div class="take-body is-hidden" id="takeBody">
+
+      <!-- cover, with the music drawn over it while it plays -->
+      <figure class="cover-stage is-hidden" id="coverWrap">
+        <img id="coverImg" alt="Album cover" />
+        <canvas id="viz" aria-hidden="true"></canvas>
+      </figure>
+
+      <dl class="meta-strip" id="metaGrid"></dl>
+
+      <!-- what the song actually is: words first, prompt beside them -->
+      <div class="word-row">
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Lyrics</h3>
+            <div class="spacer"></div>
+            <button class="btn ghost small" id="copyLyrics">Copy</button>
+          </div>
+          <pre class="lyric-text" id="metaLyrics"></pre>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h3>Prompt</h3></div>
+          <p class="prompt-text" id="metaStyle"></p>
+          <p class="prompt-text dim" id="metaCover"></p>
+        </section>
+      </div>
+
+      <details class="drawer" id="scorePanel">
+        <summary><span class="chev" aria-hidden="true"></span> Score <em class="summary-note">the editable plan</em></summary>
+        <div class="drawer-body">
+          <div class="score-head">
+            <div class="score-tabs">
+              <button class="stab is-active" data-score="staff">Staff</button>
+              <button class="stab" data-score="abc">ABC</button>
+            </div>
+            <div class="spacer"></div>
+            <button class="btn ghost small" id="reuseScore">Edit and re-render</button>
+          </div>
+          <div class="paper" id="scoreStaff"></div>
+          <pre class="paper mono is-hidden" id="scoreAbc"></pre>
+        </div>
+      </details>
+
+    </div>
+  </section>
+
+  <!-- takes -------------------------------------------------------------- -->
+  <aside class="library">
+    <header class="lib-head">
+      <h3>Takes</h3>
+      <span class="count mono" id="libCount">0</span>
+    </header>
+    <div class="lib-list" id="libList"></div>
+  </aside>
+</div>
+
+
+<!-- ---------------------------------------------------------------- playbar -->
+<footer class="playbar is-empty" id="playbar">
+  <img class="playbar-cover" id="playbarCover" alt="" hidden />
+  <div class="playbar-id">
+    <strong id="playbarTitle">Nothing loaded</strong>
+    <small id="playbarStyle">pick a take on the right</small>
+  </div>
+
+  <button class="play" id="playBtn" aria-label="Play"><span id="playGlyph">▶</span></button>
+
+  <span class="mono time" id="timeNow">0:00</span>
+  <canvas id="wave" height="40"></canvas>
+  <span class="mono time dim" id="timeTotal">0:00</span>
+
+  <div class="volume">
+    <button class="icon-btn" id="muteBtn" aria-label="Mute"><span id="muteGlyph">🔊</span></button>
+    <input type="range" id="volume" min="0" max="1" step="0.01" value="1" aria-label="Volume" />
+  </div>
+
+  <a class="btn ghost small" id="dlAudio" download>FLAC</a>
+  <audio id="audio" preload="auto"></audio>
+</footer>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/abcjs/6.7.0/abcjs-basic-min.js"
+        onerror="window.__abcjsFailed=true"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
