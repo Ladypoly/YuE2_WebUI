@@ -415,23 +415,16 @@
 
   function refreshCover() {
     return api("/api/cover/status").then(function (data) {
-      $("coverTake").innerHTML = data.takes.length
-        ? data.takes.map(function (t) {
+      var takes = data.takes || [];
+      $("coverTake").innerHTML = takes.length
+        ? takes.map(function (t) {
             return '<option value="' + escape(t.name) + '">' + escape(t.title) + "</option>";
           }).join("")
         : '<option value="">no take has a score yet</option>';
-      if (!data.sheetsage.available) {
-        $("coverFromAudio").disabled = true;
-        $("coverFile").disabled = true;
-        $("coverStatus").textContent =
-          "Transcribing a recording needs SheetSage2, which pins different dependencies and " +
-          "lives in its own environment (" + data.sheetsage.env_dir + "). See webui/README.md. " +
-          "Covering from a take works without it.";
-      } else {
-        $("coverFromAudio").disabled = false;
-        $("coverFile").disabled = false;
-        $("coverStatus").textContent = "SheetSage2 ready.";
-      }
+      $("coverFromTake").disabled = !takes.length;
+      $("coverStatus").textContent = takes.length
+        ? takes.length + " takes carry a score you can remix."
+        : "Make a song in Full plan or Melody only mode first; Direct mode keeps no score.";
     }).catch(function () {});
   }
 
@@ -454,108 +447,6 @@
       applyCoverScore(data.abc, "Melody loaded from “" + data.title + "”. Now write the new style and generate.");
     }).catch(function (error) { toast(error.message, "bad"); });
   });
-
-  $("coverFromAudio").addEventListener("click", function () {
-    var file = $("coverFile").files[0];
-    if (!file) return toast("Choose an audio file first", "bad");
-    var body = new FormData();
-    body.append("file", file);
-    body.append("melody_only", $("coverMelodyOnly").checked ? "true" : "false");
-    $("coverStatus").textContent = "Transcribing " + file.name + " — this runs SheetSage2 on the GPU…";
-    $("coverFromAudio").disabled = true;
-    api("/api/cover/from-audio", { method: "POST", body: body }).then(function (data) {
-      applyCoverScore(data.abc, "Transcribed in " + data.seconds + "s. Check the melody, then write the new style.");
-    }).catch(function (error) {
-      $("coverStatus").textContent = error.message;
-      toast(error.message, "bad");
-    }).then(function () { $("coverFromAudio").disabled = false; });
-  });
-
-  /* ------------------------------------------------------------------ art */
-
-  function paintArt(data) {
-    STATE.art = data;
-    var ready = data.installed;
-    $("artState").textContent = data.busy ? "working" : (ready ? "installed" : "not installed");
-    $("artState").dataset.s = data.busy ? "busy" : (ready ? "ready" : "missing");
-    $("artInstall").textContent = ready ? "Reinstall" : "Install";
-    $("artInstall").disabled = !!data.busy || !data.supported;
-    $("setArtAuto").checked = !!data.auto;
-
-    $("setArtModel").innerHTML = data.models.length
-      ? data.models.map(function (m) {
-          return '<option value="' + escape(m.path) + '">' + escape(m.file) + " · " + m.size_gb +
-                 " GiB · " + escape(m.source) + "</option>";
-        }).join("")
-      : '<option value="">no checkpoint found yet</option>';
-    $("artDirs").textContent = (data.dirs && data.dirs.length)
-      ? "Also scanning: " + data.dirs.join("  ·  ")
-      : "Only the download folder is scanned. Add a checkpoints folder to reuse models you already have.";
-    if (data.selected) $("setArtModel").value = data.selected;
-
-    $("artCatalog").innerHTML = data.catalog.map(function (entry) {
-      var action = entry.installed
-        ? '<button type="button" class="btn ghost small" data-artdrop="' + escape(entry.file) + '">Remove</button>'
-        : '<button type="button" class="btn ghost small" data-artget="' + escape(entry.id) + '"' +
-          (data.busy ? " disabled" : "") + ">Download</button>";
-      return '<div class="model-row' + (entry.installed ? " is-installed" : "") + '">' +
-        "<div><strong>" + escape(entry.name) + "</strong><small>" + escape(entry.note) + "</small></div>" +
-        '<span class="size">' + entry.size_gb + " GB</span>" + action + "</div>";
-    }).join("");
-  }
-
-  function refreshArt() {
-    return api("/api/art/status").then(paintArt).catch(function () {});
-  }
-
-  $("artInstall").addEventListener("click", function () {
-    api("/api/art/install", { method: "POST" })
-      .then(function () { toast("Downloading stable-diffusion.cpp (about 900 MB)"); })
-      .catch(function (error) { toast(error.message, "bad"); });
-  });
-
-  $("artCatalog").addEventListener("click", function (event) {
-    var get = event.target.closest("[data-artget]");
-    var drop = event.target.closest("[data-artdrop]");
-    if (get) {
-      var body = new FormData();
-      body.append("model_id", get.dataset.artget);
-      api("/api/art/model", { method: "POST", body: body })
-        .then(function () { toast("Downloading the checkpoint"); })
-        .catch(function (error) { toast(error.message, "bad"); });
-    } else if (drop) {
-      if (!window.confirm("Delete this checkpoint?")) return;
-      api("/api/art/model/" + encodeURIComponent(drop.dataset.artdrop), { method: "DELETE" })
-        .then(function () { toast("Checkpoint deleted"); return refreshArt(); })
-        .catch(function (error) { toast(error.message, "bad"); });
-    }
-  });
-
-  $("setArtModel").addEventListener("change", function () {
-    api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
-                           body: JSON.stringify({ art_model: this.value }) })
-      .then(refreshArt).catch(function () {});
-  });
-
-  $("setArtAuto").addEventListener("change", function () {
-    api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
-                           body: JSON.stringify({ art_auto: this.checked }) })
-      .then(refreshArt).catch(function () {});
-  });
-
-  function drawCover(name, button) {
-    if (button) { button.disabled = true; button.textContent = "Drawing…"; }
-    api("/api/art/cover/" + encodeURIComponent(name), { method: "POST" })
-      .then(function (result) {
-        toast("Cover drawn in " + result.seconds + "s", "good");
-        return refreshLibrary();
-      })
-      .catch(function (error) { toast(error.message, "bad"); })
-      .then(function () {
-        if (button) { button.disabled = false; button.textContent = "Draw cover"; }
-        if (STATE.take && STATE.take.name === name) openTake(name);
-      });
-  }
 
   /* -------------------------------------------------------------- compose */
 
@@ -779,6 +670,7 @@
       // a running cover just look broken.
       $("takeBody").classList.add("is-running");
       $("coverWrap").classList.remove("is-hidden");
+      sizeDisc();
       var pending = $("coverImg");
       if (pending.dataset.job !== job.id) {
         pending.dataset.job = job.id;
@@ -938,6 +830,7 @@
     }).join("\n");
 
     renderScore(take.score);
+    sizeDisc();
     loadPeaks(audio.src);
     paintLibrary();
     paintRunReturn();
@@ -1098,8 +991,27 @@
     return VIZ.analyser;
   }
 
-  // The disc is sized in CSS against whichever stage dimension is tighter, so
-  // read it back rather than assuming it follows the height.
+  // The artwork has to stay a circle in a box of any shape, so its size is the
+  // smaller of the stage's two dimensions. Measuring beats CSS here: the stage
+  // grows and shrinks as a run starts and ends, and the disc must follow.
+  function sizeDisc() {
+    var stage = $("coverWrap"), disc = $("coverDisc");
+    if (!stage || !disc) return;
+    var box = stage.getBoundingClientRect();
+    var side = Math.floor(Math.min(box.width, box.height) * 0.88);
+    if (side > 0 && disc.dataset.side !== String(side)) {
+      disc.dataset.side = String(side);
+      disc.style.width = side + "px";
+      disc.style.height = side + "px";
+    }
+  }
+
+  if (window.ResizeObserver) {
+    new ResizeObserver(sizeDisc).observe($("coverWrap"));
+  } else {
+    window.addEventListener("resize", sizeDisc);
+  }
+
   function discRadiusOf(fallbackHeight) {
     var disc = $("coverDisc");
     if (disc) {

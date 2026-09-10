@@ -784,8 +784,6 @@ pre.paper { font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; word-br
   height: clamp(220px, 34vh, 400px);
   display: grid;
   place-items: center;
-  /* so the disc can be sized against the stage in both directions */
-  container-type: size;
 }
 
 .cover-stage canvas {
@@ -798,10 +796,12 @@ pre.paper { font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; word-br
 
 .cover-disc {
   position: relative;
-  /* Fits whichever way the stage is tight, so a tall narrow column never
-     pushes the artwork out of its own box. */
-  width: min(88cqh, 88cqw);
-  height: min(88cqh, 88cqw);
+  /* Size comes from a ResizeObserver in the client: it has to be the smaller of
+     the stage's two dimensions, and container-query units did not resolve
+     reliably here -- the result was an ellipse until something forced a
+     relayout. These are only the values before the first measurement. */
+  width: 88%;
+  aspect-ratio: 1 / 1;
   border-radius: 50%;              /* a disc at rest as much as in play */
   overflow: hidden;
   background: var(--sunk);

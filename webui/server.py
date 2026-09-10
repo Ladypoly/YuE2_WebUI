@@ -1331,7 +1331,13 @@ def api_cover_from_take(name: str = Form(...), melody_only: bool = Form(True)):
 
 @app.post("/api/cover/from-audio")
 async def api_cover_from_audio(file: UploadFile = File(...), melody_only: bool = Form(True)):
-    """Transcribe an uploaded recording into a score with SheetSage2."""
+    """Transcribe an uploaded recording into a score with SheetSage2.
+
+    Kept working but deliberately not surfaced in the console: SheetSage2 needs
+    its own environment and an FFmpeg 6.x whose shared libraries torchaudio can
+    bind, which is a lot of setup for the one case it serves -- covering someone
+    else's recording. Remixing a take you already made needs none of it.
+    """
     if ENGINE.status in {"busy", "loading"}:
         raise HTTPException(409, "The song model is working; transcription needs the same GPU")
     suffix = Path(file.filename or "source.wav").suffix.lower()

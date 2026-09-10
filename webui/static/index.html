@@ -256,29 +256,20 @@
       </fieldset>
 
       <details class="drawer" id="coverDrawer">
-        <summary><span class="chev" aria-hidden="true"></span> Cover or remix <em class="summary-note">reuse a melody, change the style</em></summary>
+        <summary><span class="chev" aria-hidden="true"></span> Remix a take <em class="summary-note">same melody, new style</em></summary>
         <div class="drawer-body">
-          <p class="hint">A cover keeps the melody and rebuilds everything around it. Take the score from
-            a finished take, or transcribe a recording, then write a new style prompt and render it in
-            <strong>Melody only</strong> mode.</p>
+          <p class="hint">Take the melody from a song you already made and render it somewhere else
+            entirely — a ballad as a techno track, a German song in English. The chord symbols are
+            dropped so the new style can rebuild the harmony, and the run switches to
+            <strong>Melody only</strong>.</p>
 
           <div class="field-row">
             <label class="field grow">
-              <span class="label">From a take</span>
+              <span class="label">Melody from</span>
               <select id="coverTake"></select>
             </label>
             <div class="field reset-cell">
               <button type="button" class="btn ghost" id="coverFromTake">Use this melody</button>
-            </div>
-          </div>
-
-          <div class="field-row">
-            <label class="field grow">
-              <span class="label">From a recording <em>wav, flac, mp3, m4a, ogg</em></span>
-              <input type="file" id="coverFile" accept=".wav,.flac,.mp3,.m4a,.ogg,.opus,.aac" />
-            </label>
-            <div class="field reset-cell">
-              <button type="button" class="btn ghost" id="coverFromAudio">Transcribe</button>
             </div>
           </div>
 
