@@ -5,10 +5,33 @@ once, then passes that same token to ``step``. Prefixes retain independent RoPE
 positions and cache slots. No vLLM, Triton, or custom extension is imported.
 """
 from __future__ import annotations
+from functools import lru_cache
 from numbers import Integral
 
 import torch
 import torch.nn.functional as F
+
+
+@lru_cache(maxsize=None)
+def _flash_varlen_available(device_index, dtype, head_dim):
+    """Whether the varlen FlashAttention kernel can actually run here.
+
+    Some official builds register ``_flash_attention_forward`` without
+    compiling its kernels; the Windows CUDA wheels do, and only raise
+    "USE_FLASH_ATTENTION was not enabled for build" once a decode step calls
+    it. Registration alone is therefore not evidence, so run one tiny call.
+    """
+    try:
+        device = torch.device("cuda", device_index)
+        with torch.inference_mode():
+            packed = torch.zeros(1, 1, head_dim, device=device, dtype=dtype)
+            offsets = torch.tensor([0, 1], dtype=torch.int32, device=device)
+            used = torch.ones(1, dtype=torch.int32, device=device)
+            torch.ops.aten._flash_attention_forward(packed, packed, packed, offsets, offsets,
+                                                    1, 1, 0.0, False, False, seqused_k=used)
+        return True
+    except Exception:
+        return False
 
 
 class _PrefixCache:
@@ -73,7 +96,9 @@ class GraphAR:
             raise ValueError("attention_backend must be auto, flash, cudnn, or sdpa")
         fused = self.device.type == "cuda" and self.dtype in {torch.bfloat16, torch.float16} and config.head_dim % 8 == 0
         flash = fused and config.head_dim <= 256 and hasattr(torch.ops.aten, "_flash_attention_forward") and (
-            "seqused_k" in str(torch.ops.aten._flash_attention_forward.default._schema))
+            "seqused_k" in str(torch.ops.aten._flash_attention_forward.default._schema)) and (
+            _flash_varlen_available(self.device.index if self.device.index is not None
+                                    else torch.cuda.current_device(), self.dtype, config.head_dim))
         # Torch 2.10 is pinned by the package. Its native variable-length FA
         # accepts GPU effective lengths; the public masked SDPA can select a
         # much slower math kernel. Keep a cuDNN/public-SDPA fallback explicit.
