@@ -191,6 +191,8 @@
       </div>
       <p class="row-hint" id="structureHint"></p>
       <div class="muse-foot">
+        <label class="check"><input type="checkbox" id="autoRun" />
+          <span><strong>Write and generate</strong> — go straight on to the song</span></label>
         <label class="check"><input type="checkbox" id="museFree" checked />
           <span>Unload YuE2 first, writer straight after — shared VRAM</span></label>
         <span class="muse-status mono" id="museStatus"></span>
@@ -340,6 +342,9 @@
       <h2 id="takeTitle">Nothing playing</h2>
       <span class="col-note" id="takeEyebrow">no run yet</span>
       <div class="spacer"></div>
+      <button class="btn ghost small run-return is-hidden" id="backToRun">
+        <span class="run-dot" aria-hidden="true"></span> <span id="backToRunLabel">Back to the run</span>
+      </button>
       <div class="head-actions" id="takeActions"></div>
     </div>
 
@@ -362,8 +367,8 @@
 
       <!-- cover, with the music drawn over it while it plays -->
       <figure class="cover-stage is-hidden" id="coverWrap">
-        <img id="coverImg" alt="Album cover" />
         <canvas id="viz" aria-hidden="true"></canvas>
+        <div class="cover-disc" id="coverDisc"><img id="coverImg" alt="Album cover" /></div>
       </figure>
 
       <dl class="meta-strip" id="metaGrid"></dl>

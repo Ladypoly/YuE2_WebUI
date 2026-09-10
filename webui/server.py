@@ -38,6 +38,15 @@ VAE_CHOICES = {"standard": "m-a-p/YuE2-Vae", "legacy": "m-a-p/YuE2-Vae-legacy"}
 BUNDLED = ROOT / "models"
 
 
+def weights_on_disk():
+    """True when the song model is already local, bundled or in the HF cache."""
+    if (BUNDLED / "YuE2-3B" / "config.json").is_file():
+        return True
+    cache = Path.home() / ".cache" / "huggingface" / "hub"
+    folder = "models--" + str(SETTINGS.model).replace("/", "--")
+    return (cache / folder).is_dir()
+
+
 def bundled_or_hub(repo):
     local = BUNDLED / str(repo).split("/")[-1]
     return str(local) if (local / "config.json").is_file() else repo
@@ -97,7 +106,6 @@ class Settings:
     llamacpp_gpu_layers: int = 999
     art_model: str = ""
     art_auto: bool = False
-    nar_query_chunk: int = 2048         # 0 = whole sequence at once
     writer_dirs: list = dataclasses.field(default_factory=list)
     art_dirs: list = dataclasses.field(default_factory=list)
 
@@ -159,38 +167,6 @@ def vram():
                 "allocated_gib": round(torch.cuda.memory_allocated() / 2 ** 30, 2)}
     except Exception:
         return None
-
-
-_NAR_PATCHED = False
-
-
-def apply_nar_chunking():
-    """Bound the synthesis attention's working set.
-
-    yue2.nar.synthesize takes query_chunk_size, but the pipeline never passes it,
-    so on CUDA the block defaults to the entire sequence. Attention memory then
-    grows with the square of the song length, and a four-minute song can ask for
-    a 1.4 GiB contiguous block on a card that has nothing like it left. The
-    pipeline imports the function inside the method, so replacing the module
-    attribute is enough.
-    """
-    global _NAR_PATCHED
-    if _NAR_PATCHED:
-        return
-    try:
-        from yue2 import nar
-    except Exception:
-        return
-    original = nar.synthesize
-
-    def chunked(*args, **kwargs):
-        size = int(SETTINGS.nar_query_chunk or 0)
-        if size > 0:
-            kwargs.setdefault("query_chunk_size", size)
-        return original(*args, **kwargs)
-
-    nar.synthesize = chunked
-    _NAR_PATCHED = True
 
 
 class Engine:
@@ -260,7 +236,6 @@ class Engine:
             generation_config=config,
             progress=True,
         )
-        apply_nar_chunking()
         self.pipe = pipe
         self.loaded_with = want
         self.ever_loaded = True
@@ -291,6 +266,7 @@ class Job:
                        for key, label, note in STAGES}
         self.setup = ""
         self.setup_at = None
+        self.cover_ready = False
         self.abc_partial = ""
         self.abc_tokens = []
         self._last_push = 0.0
@@ -303,7 +279,8 @@ class Job:
                 "finished": self.finished, "take": self.take,
                 "title": self.spec.get("title") or self.spec.get("id") or "Untitled take",
                 "seed": self.spec.get("seed"), "cot": self.spec.get("cot"),
-                "stages": list(self.stages.values()), "abc_partial": self.abc_partial}
+                "stages": list(self.stages.values()), "abc_partial": self.abc_partial,
+                "cover_ready": self.cover_ready}
 
     def push(self, force=False):
         now = time.monotonic()
@@ -396,6 +373,13 @@ def _sampling(overrides, base):
     return dataclasses.replace(base, **values) if values else None
 
 
+def is_oom(exc):
+    """True for a CUDA out-of-memory error, whatever wrapper it arrives in."""
+    if exc.__class__.__name__ in {"OutOfMemoryError", "CudaOutOfMemoryError"}:
+        return True
+    return "out of memory" in str(exc).lower()
+
+
 def run_job(job):
     from yue2.protocol import GenerationConfig
 
@@ -414,14 +398,17 @@ def run_job(job):
         with contextlib.suppress(Exception):
             job.cover_seconds = ART.draw(art_model_path(), spec["cover"],
                                          PENDING_COVER, seed=int(spec["seed"]))["seconds"]
+            job.cover_ready = PENDING_COVER.is_file()
         job.setup = ""
         job.setup_at = None
         job.push(force=True)
 
     if ENGINE.pipe is None:
         # Model resolution happens before the progress reporter is swapped in.
-        job.setup = ("Loading model and decoder into VRAM" if ENGINE.ever_loaded
-                     else "Loading model and decoder (the first run downloads weights)")
+        # Only promise a download when the weights are genuinely absent; after a
+        # server restart they are on disk and nothing is fetched.
+        job.setup = ("Loading model and decoder into VRAM" if weights_on_disk()
+                     else "Loading model and decoder (downloading weights, about 7 GB)")
         job.setup_at = time.time()
         job.push(force=True)
     pipe = ENGINE.ensure()
@@ -439,19 +426,34 @@ def run_job(job):
                 job.abc_partial = pipe.tokenizer.decode(job.abc_tokens)
 
     semantic_overrides = dict(spec.get("semantic_sampling") or {})
-    result = pipe(
-        style=spec["style"],
-        lyrics=spec["lyrics"],
-        cot=spec.get("cot", "full"),
-        seed=int(spec["seed"]),
-        id=spec.get("id", "song"),
-        abc=spec.get("abc") or None,
-        cfg_scale=spec.get("cfg_scale"),
-        abc_sampling=_sampling(spec.get("abc_sampling"), defaults.abc),
-        semantic_sampling=_sampling(semantic_overrides, defaults.semantic),
-        cancelled=job.cancel_flag.is_set,
-        on_token=on_token,
-    )
+    def render():
+        return pipe(
+            style=spec["style"],
+            lyrics=spec["lyrics"],
+            cot=spec.get("cot", "full"),
+            seed=int(spec["seed"]),
+            id=spec.get("id", "song"),
+            abc=spec.get("abc") or None,
+            cfg_scale=spec.get("cfg_scale"),
+            abc_sampling=_sampling(spec.get("abc_sampling"), defaults.abc),
+            semantic_sampling=_sampling(semantic_overrides, defaults.semantic),
+            cancelled=job.cancel_flag.is_set,
+            on_token=on_token,
+        )
+
+    try:
+        result = render()
+    except Exception as exc:
+        if is_oom(exc) and not job.cancel_flag.is_set():
+            # The protocol pins the acoustic context to 24576, so there is no
+            # smaller setting to fall back to. Say what does help instead of
+            # retrying something that cannot work.
+            raise RuntimeError(
+                "Ran out of VRAM while synthesising. Synthesis memory grows with the "
+                "song, so the usual fixes are a shorter lyric, closing other GPU "
+                "programs, or switching quantization to fp8 under Engine. "
+                "Original error: " + str(exc)) from exc
+        raise
 
     folder = time.strftime("%Y%m%d-%H%M%S") + "-" + spec.get("id", "song")
     directory = OUTPUTS / folder
@@ -573,6 +575,19 @@ an instrument, a genre, a tempo or the song title, and never ask for text,
 letters or a title inside the image. The user's message says which shape to
 write it in.
 
+Write like a person who was there, not like a machine describing a mood.
+
+- Name concrete things: an object, a place, a time, something someone did.
+  "Your coat still on the hook" beats "memories of you".
+- One image per line, and let it carry the feeling instead of naming it.
+  Write the evidence, not the emotion.
+- Never use these, in any language: neon, echoes, whispers, dancing shadows,
+  city lights, fading light, endless night, burning desire, fire inside,
+  broken heart, shattered dreams, breaking chains, spreading wings, endless
+  road, chasing dreams, weathering the storm, hidden scars, lost in time,
+  rising from the ashes, standing tall, feeling alive.
+- Avoid rhyming on fire/desire, night/light, heart/apart, rain/pain.
+
 title must never be empty, and cover must never be empty.
 
 This is the exact shape of the lyrics field, tags included:
@@ -590,6 +605,11 @@ RETRY_NOTE = ("Your previous answer had no section tags. Rewrite the lyrics with
               "order given above, each tag alone on its own line, spelled exactly as shown, "
               "for example a line containing only [Chorus].")
 
+CLICHE_NOTE = ("Your previous answer used these worn-out phrases: %s. Rewrite the lyrics "
+               "without them and without any near-synonym of them. Replace each one with a "
+               "concrete detail: a named object, a place, a time of day, or something "
+               "somebody actually does. Keep the same structure, section tags and language.")
+
 
 def has_sections(lyrics):
     return any(line.strip().startswith("[") for line in str(lyrics).splitlines())
@@ -605,6 +625,51 @@ STRUCTURES = {
              "[Chorus]", "[Bridge]", "[Chorus]", "[Outro]"],
 }
 DEFAULT_STRUCTURE = "bridge"
+
+# Phrases that turn up in AI lyrics again and again. Collected from what
+# songwriting communities and lyric checkers actually complain about, not from
+# taste: "neon", "echoes", "shadows", "whispers" and the stock metaphors below
+# are the ones people name when they say a song sounds machine-written.
+CLICHES = [
+    # the notorious four
+    "neon", "echoes", "echo of", "whisper", "shadows dance", "dancing in the shadow",
+    "dance in the shadow", "chasing shadows", "city lights",
+    # light and dark
+    "fading light", "endless night", "into the night", "dead of night",
+    "burning bright", "blinding light", "silver moon", "moonlit",
+    # fire
+    "burning desire", "fire inside", "hearts on fire", "flames of",
+    "rise from the ashes", "phoenix", "set the night on fire",
+    # breakage
+    "broken heart", "shattered dreams", "shattered glass", "picking up the pieces",
+    "break these chains", "breaking free", "spread my wings", "silent scream",
+    # journeys
+    "endless road", "path unknown", "long road", "chasing dreams", "no turning back",
+    # weather
+    "weather the storm", "drowning in", "eye of the storm", "tears like rain",
+    "storm inside",
+    # pain and time
+    "hidden scars", "unseen tears", "lost in time", "memories fade", "frozen in time",
+    "against all odds", "rise again", "stand tall", "feel alive", "come alive",
+    # synth-pop filler
+    "electric dreams", "concrete jungle", "velvet sky", "crimson sky",
+    # the same in German, since songs here are often written in it
+    "neonlicht", "neonlichter", "im schatten tanz", "tanz im schatten",
+    "zerbrochene träume", "gebrochenes herz", "ketten sprengen",
+    "asche", "flügel", "sterne verglühen", "endlose nacht", "im regen stehen",
+]
+
+
+# The ones people name first when a song sounds machine-written. A single
+# occurrence of any of these is worth a rewrite; the rest only matter in bulk.
+WORST = {"neon", "echoes", "whisper", "shadows dance", "dancing in the shadow",
+         "city lights", "neonlicht", "neonlichter"}
+
+
+def find_cliches(text):
+    lowered = str(text).lower()
+    return sorted({phrase for phrase in CLICHES if phrase in lowered})
+
 
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 
@@ -908,7 +973,6 @@ class SettingsBody(BaseModel):
     llamacpp_gpu_layers: int | None = None
     art_model: str | None = None
     art_auto: bool | None = None
-    nar_query_chunk: int | None = None
     writer_dirs: list[str] | None = None
     art_dirs: list[str] | None = None
 
@@ -1088,14 +1152,27 @@ def api_muse(body: MuseBody):
     # Section tags are what YuE2 reads as structure. Smaller writers drop them,
     # so check and give the model one corrective pass before accepting the brief.
     retried = False
+    note = None
     if not has_sections(parsed.get("lyrics", "")):
+        note = RETRY_NOTE
+    else:
+        # Asking nicely is not enough on its own: check the words that come back
+        # and give the model one chance to do better.
+        found = find_cliches(parsed.get("lyrics", ""))
+        if len(found) >= 2 or any(phrase in WORST for phrase in found):
+            note = CLICHE_NOTE % ", ".join(found[:8])
+
+    if note:
         retried = True
         second = messages + [{"role": "assistant", "content": content},
-                             {"role": "user", "content": RETRY_NOTE}]
+                             {"role": "user", "content": note}]
         try:
             content2, model, extra2 = ask(second)
             parsed2 = json.loads(_strip_thinking(content2))
-            if has_sections(parsed2.get("lyrics", "")):
+            better = has_sections(parsed2.get("lyrics", "")) and (
+                len(find_cliches(parsed2.get("lyrics", ""))) <=
+                len(find_cliches(parsed.get("lyrics", ""))))
+            if better:
                 parsed, extra = parsed2, extra2
         except Exception:
             pass
@@ -1115,6 +1192,7 @@ def api_muse(body: MuseBody):
                  "lyrics": lyrics,
                  "sections": [l.strip() for l in lyrics.splitlines() if l.strip().startswith("[")],
                  "backend": backend, "model": model, "retried": retried,
+                 "cliches": find_cliches(lyrics),
                  "seconds": round(time.perf_counter() - start, 1),
                  "lines": len(sung), "freed_engine": freed}, **extra)
 
@@ -1283,6 +1361,15 @@ def api_free(unload: bool = False):
     ENGINE.unload() if unload else ENGINE.park()
     BUS.publish("engine", ENGINE.describe())
     return {"before": before, "after": vram(), "unloaded": bool(unload)}
+
+
+@app.get("/api/pending-cover")
+def api_pending_cover():
+    """The sleeve drawn before the song, so the run has something to show."""
+    if not PENDING_COVER.is_file():
+        raise HTTPException(404, "No cover is waiting")
+    return FileResponse(PENDING_COVER, media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/vram")

@@ -22,6 +22,7 @@
     settings: null,
     takes: [],
     job: null,          // the run being watched
+    running: null,      // the live run, even while a finished take is open
     take: null,         // the take being inspected
     examples: null,
     peaks: null,
@@ -348,13 +349,20 @@
   });
   $("museBtn").addEventListener("click", writeBrief);
 
+  try {
+    $("autoRun").checked = localStorage.getItem("yue2.autorun") === "1";
+  } catch (error) { /* private mode */ }
+  $("autoRun").addEventListener("change", function () {
+    try { localStorage.setItem("yue2.autorun", this.checked ? "1" : "0"); } catch (error) {}
+  });
+
   function writeBrief() {
     var idea = $("idea").value.trim();
     if (!idea) { $("idea").focus(); return toast("Describe the song in a line first", "bad"); }
 
     var button = $("museBtn"), started = Date.now();
     button.dataset.busy = "1";
-    $("museLabel").textContent = "Writing…";
+    $("museLabel").textContent = $("autoRun").checked ? "Writing, then generating…" : "Writing…";
     $("museStatus").classList.remove("bad");
     $("museStatus").textContent = "loading " + ($("museModel").value || "the writer");
     var ticker = setInterval(function () {
@@ -376,13 +384,23 @@
       STATE.coverPrompt = brief.cover || "";
       $("coverLine").textContent = STATE.coverPrompt ? "Cover: " + STATE.coverPrompt : "";
       var cut = brief.done_reason === "length";
+      var cliches = brief.cliches || [];
       $("museStatus").textContent = brief.backend + " · " + brief.seconds + "s · " + brief.lines + " lines · " +
         (brief.sections || []).length + " sections" +
+        (brief.retried ? " · rewritten once" : "") +
+        (cliches.length ? " · stock phrases left: " + cliches.join(", ") : "") +
         (cut ? " · CUT OFF at the token limit" : "") + " · " +
         (brief.unloaded ? "writer unloaded" : "writer STILL LOADED");
       if (!brief.unloaded || cut) $("museStatus").classList.add("bad");
       toast("Brief written: " + brief.title, "good");
       refreshMuse();
+      if ($("autoRun").checked) {
+        // Submit the form rather than calling the API: the one path that also
+        // reads the mode, seed, supplied score and sampling boxes.
+        $("composeForm").requestSubmit
+          ? $("composeForm").requestSubmit()
+          : $("composeForm").dispatchEvent(new Event("submit", { cancelable: true }));
+      }
     }).catch(function (error) {
       $("museStatus").textContent = "";
       toast(error.message, "bad");
@@ -648,6 +666,8 @@
   var runTimer = null;
 
   function watchJob(job) {
+    stopRunViz();
+    $("takeBody").classList.remove("is-running");
     STATE.job = job;
     STATE.take = null;
     STATE.peaks = null;
@@ -676,8 +696,21 @@
     }
   }
 
+  // The way back only makes sense while a run is live and you are elsewhere.
+  function paintRunReturn() {
+    var away = !!(STATE.running && STATE.take);
+    $("backToRun").classList.toggle("is-hidden", !away);
+    if (away) $("backToRunLabel").textContent = "Back to " + STATE.running.title;
+  }
+
   function paintJob(job) {
     STATE.job = job;
+
+    // Keep the live run reachable even when a finished take is open.
+    var live = job.state === "running" || job.state === "queued";
+    STATE.running = live ? job : (STATE.running && STATE.running.id === job.id ? null : STATE.running);
+    paintRunReturn();
+
     var stateLabels = { queued: "Queued", running: "Running", done: "Complete", failed: "Failed", cancelled: "Cancelled" };
     $("runState").textContent = stateLabels[job.state] || job.state;
     $("runState").dataset.s = job.state;
@@ -739,6 +772,26 @@
     });
     $("stages").innerHTML = html;
 
+    // The sleeve was drawn before the song, so show it and let it carry the wait.
+    if (job.cover_ready && !STATE.take) {
+      $("takeBody").classList.remove("is-hidden");
+      // Lyrics, prompt and score belong to a finished take; empty panels beside
+      // a running cover just look broken.
+      $("takeBody").classList.add("is-running");
+      $("coverWrap").classList.remove("is-hidden");
+      var pending = $("coverImg");
+      if (pending.dataset.job !== job.id) {
+        pending.dataset.job = job.id;
+        pending.onload = function () { readCoverPalette(pending); };
+        pending.src = "/api/pending-cover?j=" + encodeURIComponent(job.id);
+      }
+      if (job.state === "running") {
+        startRunViz(phaseProgress(job, BUILD_STAGES), phaseProgress(job, REFINE_STAGES));
+      } else {
+        stopRunViz();
+      }
+    }
+
     if (job.abc_partial && !STATE.take) {
       $("takeBody").classList.remove("is-hidden");
       $("scorePanel").classList.remove("is-hidden");
@@ -752,8 +805,35 @@
     if (job.state === "failed" && job.error) toastOnce(job.id, job.error, "bad");
     if (job.state === "done" && job.take) {
       toastOnce(job.id, "Song complete — " + job.title, "good");
-      refreshLibrary().then(function () { openTake(job.take); });
+      var wasWatching = !STATE.take;
+      refreshLibrary().then(function () {
+        // Only jump to the new song if the run is what you were looking at.
+        if (wasWatching) openTake(job.take);
+      });
     }
+  }
+
+  // The run splits into two halves for the artwork: writing the score and the
+  // music tokens builds the picture up, synthesis and decode sharpen it.
+  var BUILD_STAGES = { plan: 0.3, semantic: 0.7 };
+  var REFINE_STAGES = { synthesize: 0.85, decode: 0.15 };
+
+  function stageShare(stage) {
+    if (stage.state === "completed") return 1;
+    if (stage.state !== "running") return 0;
+    // Only synthesis and decode report a total; the token stages are open-ended,
+    // so approach 1 without ever claiming to have arrived.
+    if (stage.total) return Math.min(1, stage.completed / stage.total);
+    return 1 - Math.exp(-stage.completed / 1800);
+  }
+
+  function phaseProgress(job, weights) {
+    var done = 0;
+    job.stages.forEach(function (stage) {
+      var weight = weights[stage.key];
+      if (weight) done += weight * stageShare(stage);
+    });
+    return done;
   }
 
   var toasted = {};
@@ -762,6 +842,17 @@
     toasted[key] = true;
     toast(message, kind);
   }
+
+  $("backToRun").addEventListener("click", function () {
+    if (!STATE.running) return;
+    STATE.take = null;
+    $("takeBody").classList.add("is-hidden");
+    $("coverImg").dataset.job = "";      // force the pending cover to reload
+    paintLibrary();
+    paintRunReturn();
+    watchJob(STATE.running);
+    show("take");
+  });
 
   $("cancelRun").addEventListener("click", function () {
     if (!STATE.job) return;
@@ -775,6 +866,9 @@
   function openTake(name) {
     var take = STATE.takes.filter(function (t) { return t.name === name; })[0];
     if (!take) return;
+    stopRunViz();
+    $("takeBody").classList.remove("is-running");
+    $("coverImg").dataset.job = "";
     STATE.take = take;
     STATE.peaks = null;
     STATE.job = null;
@@ -798,7 +892,11 @@
 
     $("coverWrap").classList.toggle("is-hidden", !take.has_cover);
     if (take.has_cover) {
-      $("coverImg").src = "/api/library/" + encodeURIComponent(take.name) + "/cover?t=" + Date.now();
+      var cover = $("coverImg");
+      cover.onload = function () { readCoverPalette(cover); };
+      cover.src = "/api/library/" + encodeURIComponent(take.name) + "/cover?t=" + Date.now();
+    } else {
+      VIZ.palette = null;
     }
 
     var audio = $("audio");
@@ -842,6 +940,7 @@
     renderScore(take.score);
     loadPeaks(audio.src);
     paintLibrary();
+    paintRunReturn();
     show("take");
   }
 
@@ -906,7 +1005,79 @@
      graph is built once: a MediaElementSource can only be created per element,
      and it must reach the destination or the sound disappears. */
 
-  var VIZ = { analyser: null, data: null, frame: 0 };
+  var VIZ = {
+    analyser: null, data: null, frame: 0, palette: null,
+    pulse: 0,        // what the disc actually shows
+    envelope: 0,     // rectified bass, attack fast and release slow
+    baseline: 0      // slow average, so the pulse follows beats not loudness
+  };
+
+  // Read the sleeve's own colours so the bars belong to the artwork rather than
+  // sitting on top of it in a fixed accent.
+  function readCoverPalette(image) {
+    VIZ.palette = null;
+    try {
+      var size = 48;                       // enough for hue, cheap to scan
+      var scratch = document.createElement("canvas");
+      scratch.width = scratch.height = size;
+      var ctx = scratch.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(image, 0, 0, size, size);
+      var pixels = ctx.getImageData(0, 0, size, size).data;
+
+      // Bucket by hue, weighted by saturation, so a grey sleeve does not vote.
+      var buckets = new Array(18);
+      for (var b = 0; b < 18; b++) buckets[b] = { weight: 0, r: 0, g: 0, bl: 0 };
+      for (var i = 0; i < pixels.length; i += 4) {
+        var r = pixels[i], g = pixels[i + 1], bl = pixels[i + 2];
+        var max = Math.max(r, g, bl), min = Math.min(r, g, bl);
+        if (max < 40) continue;            // near-black tells us nothing
+        var delta = max - min;
+        var sat = max === 0 ? 0 : delta / max;
+        var hue = 0;
+        if (delta) {
+          if (max === r) hue = ((g - bl) / delta + 6) % 6;
+          else if (max === g) hue = (bl - r) / delta + 2;
+          else hue = (r - g) / delta + 4;
+          hue *= 60;
+        }
+        var slot = Math.min(17, Math.floor(hue / 20));
+        var weight = 0.15 + sat;
+        buckets[slot].weight += weight;
+        buckets[slot].r += r * weight;
+        buckets[slot].g += g * weight;
+        buckets[slot].bl += bl * weight;
+      }
+      var ranked = buckets.filter(function (x) { return x.weight > 0; })
+                          .sort(function (a, b) { return b.weight - a.weight; })
+                          .slice(0, 3)
+                          .map(function (x) {
+                            return [Math.round(x.r / x.weight),
+                                    Math.round(x.g / x.weight),
+                                    Math.round(x.bl / x.weight)];
+                          });
+      if (ranked.length) VIZ.palette = ranked;
+    } catch (error) {
+      VIZ.palette = null;                  // fall back to the console accent
+    }
+  }
+
+  function barColour(position, level) {
+    var alpha = 0.35 + level * 0.65;
+    if (!VIZ.palette) return "rgba(232, 163, 61, " + alpha + ")";
+    // Walk the ring through the sleeve's colours, blending between them.
+    var span = VIZ.palette.length;
+    var scaled = position * span;
+    var first = VIZ.palette[Math.floor(scaled) % span];
+    var second = VIZ.palette[(Math.floor(scaled) + 1) % span];
+    var mix = scaled - Math.floor(scaled);
+    var lift = 1 + level * 0.5;            // louder bars read brighter
+    var channel = function (a, b) {
+      return Math.min(255, Math.round((a + (b - a) * mix) * lift));
+    };
+    return "rgba(" + channel(first[0], second[0]) + "," +
+                     channel(first[1], second[1]) + "," +
+                     channel(first[2], second[2]) + "," + alpha + ")";
+  }
 
   function ensureAnalyser() {
     if (VIZ.analyser || !window.AudioContext) return VIZ.analyser;
@@ -915,7 +1086,7 @@
       var source = context.createMediaElementSource(audio);
       var analyser = context.createAnalyser();
       analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.75;
+      analyser.smoothingTimeConstant = 0.86;
       source.connect(analyser);
       analyser.connect(context.destination);
       VIZ.analyser = analyser;
@@ -927,58 +1098,250 @@
     return VIZ.analyser;
   }
 
+  // The disc is sized in CSS against whichever stage dimension is tighter, so
+  // read it back rather than assuming it follows the height.
+  function discRadiusOf(fallbackHeight) {
+    var disc = $("coverDisc");
+    if (disc) {
+      var box = disc.getBoundingClientRect();
+      if (box.width > 4) return box.width / 2;
+    }
+    return fallbackHeight * 0.44;
+  }
+
   function drawViz() {
     var canvas = $("viz");
     var analyser = VIZ.analyser;
     if (!analyser || audio.paused) { VIZ.frame = 0; return; }
 
+    var width = canvas.clientWidth, height = canvas.clientHeight;
+    if (!width || !height) { VIZ.frame = requestAnimationFrame(drawViz); return; }
     var dpr = window.devicePixelRatio || 1;
-    var size = canvas.clientWidth;
-    if (!size) { VIZ.frame = requestAnimationFrame(drawViz); return; }
-    if (canvas.width !== Math.floor(size * dpr)) {
-      canvas.width = canvas.height = Math.floor(size * dpr);
+    if (canvas.width !== Math.floor(width * dpr) || canvas.height !== Math.floor(height * dpr)) {
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
     }
     var ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, size, size);
+    ctx.clearRect(0, 0, width, height);
 
     analyser.getByteFrequencyData(VIZ.data);
     var bins = VIZ.data;
-    var bars = 72;
-    var centre = size / 2;
-    var radius = size * 0.40;
-    var maxBar = size * 0.085;
+    var cx = width / 2, cy = height / 2;
+    var discRadius = discRadiusOf(height);
 
-    ctx.lineCap = "round";
-    for (var i = 0; i < bars; i++) {
-      // Low bins hold most of the energy, so read them on a curve.
-      var index = Math.floor(Math.pow(i / bars, 1.7) * (bins.length - 1));
-      var level = bins[index] / 255;
-      var length = 2 + level * maxBar;
-      var angle = (i / bars) * Math.PI * 2 - Math.PI / 2;
-      var x1 = centre + Math.cos(angle) * radius;
-      var y1 = centre + Math.sin(angle) * radius;
-      var x2 = centre + Math.cos(angle) * (radius + length);
-      var y2 = centre + Math.sin(angle) * (radius + length);
-      ctx.strokeStyle = "rgba(232, 163, 61, " + (0.35 + level * 0.65) + ")";
-      ctx.lineWidth = size * 0.008;
-      ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.stroke();
+    // Bass drives the pulse. Average the lowest bins rather than picking one,
+    // so a single resonant frequency cannot make the sleeve jitter.
+    var bass = 0;
+    for (var b = 1; b < 8; b++) bass += bins[b];
+    bass = bass / (7 * 255);
+
+    // A dense mix keeps the bass bins permanently high, so scaling the sleeve by
+    // the raw level is just shake. Three stages fix that:
+    //   1. a slow baseline, so only what rises ABOVE the current loudness counts
+    //   2. an envelope with a fast attack and a slow release, like a compressor
+    //   3. a smoothstep, so the motion eases in and out instead of tracking
+    VIZ.baseline += (bass - VIZ.baseline) * 0.015;
+    var excess = Math.max(0, bass - VIZ.baseline * 1.06);
+    var hit = Math.min(1, excess * 3.2);
+    VIZ.envelope += (hit - VIZ.envelope) * (hit > VIZ.envelope ? 0.30 : 0.045);
+    var eased = VIZ.envelope * VIZ.envelope * (3 - 2 * VIZ.envelope);
+    VIZ.pulse += (eased - VIZ.pulse) * 0.25;
+    var disc = $("coverDisc");
+    if (disc) {
+      disc.style.setProperty("--pulse", VIZ.pulse.toFixed(3));
+      var rim = VIZ.palette ? VIZ.palette[0] : [232, 163, 61];
+      disc.style.setProperty("--rim", rim[0] + " " + rim[1] + " " + rim[2]);
     }
 
-    // A progress arc on the same circle, so position is readable at a glance.
+    // --------------------------------------------------- mirrored spectrum
+    var gap = Math.max(10, discRadius + width * 0.012);   // clear of the disc
+    var span = cx - gap;                                  // room on either side
+    if (span > 20) {
+      var barWidth = Math.max(3, width * 0.005);
+      var stride = barWidth * 2.1;
+      var count = Math.floor(span / stride);
+      var maxBar = Math.min(height * 0.46, discRadius * 1.15);
+      for (var i = 0; i < count; i++) {
+        // Low frequencies sit next to the artwork and climb outward; read them
+        // on a curve or the outer half of the band never moves.
+        var index = Math.floor(Math.pow(i / count, 1.7) * (bins.length - 1));
+        var level = bins[index] / 255;
+        var bar = Math.max(2, level * maxBar);
+        var offset = gap + i * stride;
+        ctx.fillStyle = barColour(i / count, level);
+        // the same bar to the left and to the right
+        ctx.fillRect(cx + offset, cy - bar / 2, barWidth, bar);
+        ctx.fillRect(cx - offset - barWidth, cy - bar / 2, barWidth, bar);
+      }
+    }
+
+    // a soft bloom behind the disc that breathes with the bass
+    if (VIZ.pulse > 0.02) {
+      var accent = VIZ.palette ? VIZ.palette[0] : [232, 163, 61];
+      var bloom = ctx.createRadialGradient(cx, cy, discRadius, cx, cy,
+                                           discRadius * (1.3 + VIZ.pulse * 0.7));
+      bloom.addColorStop(0, "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + "," + (VIZ.pulse * 0.22) + ")");
+      bloom.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = bloom;
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    // -------------------------------------------------------------- position
     if (isFinite(audio.duration) && audio.duration > 0) {
-      ctx.strokeStyle = "rgba(240, 231, 216, .85)";
-      ctx.lineWidth = size * 0.006;
+      var head = VIZ.palette ? VIZ.palette[0] : [240, 231, 216];
+      ctx.strokeStyle = "rgba(" + head[0] + "," + head[1] + "," + head[2] + ",.85)";
+      ctx.lineWidth = Math.max(2, discRadius * 0.02);
+      ctx.lineCap = "round";
       ctx.beginPath();
-      ctx.arc(centre, centre, radius - size * 0.02, -Math.PI / 2,
+      ctx.arc(cx, cy, discRadius + ctx.lineWidth, -Math.PI / 2,
               -Math.PI / 2 + (audio.currentTime / audio.duration) * Math.PI * 2);
       ctx.stroke();
     }
 
     VIZ.frame = requestAnimationFrame(drawViz);
+  }
+
+  /* ------------------------------------------------- run animation on the art */
+  /* The sleeve exists minutes before the audio does, so it carries the wait:
+     a slow sweep across the picture and a ring that fills with the run. */
+
+  var RUN_VIZ = {
+    frame: 0, phase: 0,
+    build: 0, buildTarget: 0,     // rows revealed outward from the centre
+    refine: 0, refineTarget: 0,   // blur resolving into the finished picture
+    scratch: null
+  };
+
+  // Cheap downscale target: drawing the sleeve into a tiny canvas and blowing it
+  // back up is what produces the blur, and the size of that canvas is the
+  // sharpness. 10 px is barely a shape; the full width is the real image.
+  function scratchCanvas(resolution) {
+    if (!RUN_VIZ.scratch) RUN_VIZ.scratch = document.createElement("canvas");
+    var scratch = RUN_VIZ.scratch;
+    if (scratch.width !== resolution) scratch.width = scratch.height = resolution;
+    return scratch;
+  }
+
+  function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
+
+  function drawRunViz() {
+    var canvas = $("viz");
+    var width = canvas.clientWidth, height = canvas.clientHeight;
+    if (!width || !height) { RUN_VIZ.frame = requestAnimationFrame(drawRunViz); return; }
+    var dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.floor(width * dpr) || canvas.height !== Math.floor(height * dpr)) {
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+    }
+    var ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    // Ease towards the reported progress; a stage change must never snap.
+    RUN_VIZ.build += (RUN_VIZ.buildTarget - RUN_VIZ.build) * 0.05;
+    RUN_VIZ.refine += (RUN_VIZ.refineTarget - RUN_VIZ.refine) * 0.05;
+    RUN_VIZ.phase += 0.02;
+
+    var accent = VIZ.palette ? VIZ.palette[0] : [232, 163, 61];
+    var second = VIZ.palette && VIZ.palette[1] ? VIZ.palette[1] : accent;
+    var cx = width / 2, cy = height / 2;
+    // The disc is hidden during the reveal, so take its resting size from the
+    // stage the same way the CSS does.
+    var radius = Math.min(width, height) * 0.44;
+    var pulse = Math.sin(RUN_VIZ.phase * 2) * 0.5 + 0.5;
+
+    var image = $("coverImg");
+    if (image && image.naturalWidth > 0) {
+      // Sharpness follows the second half of the run: while the score and the
+      // music tokens are being written the picture is only a suggestion.
+      var art = radius * 2;
+      var resolution = Math.max(10, Math.round(easeOut(RUN_VIZ.refine) * art));
+      var scratch = scratchCanvas(resolution);
+      var small = scratch.getContext("2d");
+      small.clearRect(0, 0, resolution, resolution);
+      small.drawImage(image, 0, 0, resolution, resolution);
+
+      // Rows open outward from the middle as the first half progresses, inside
+      // the circle the artwork will occupy.
+      var band = Math.max(1, easeOut(RUN_VIZ.build) * radius);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.beginPath();
+      ctx.rect(cx - radius, cy - band, art, band * 2);
+      ctx.clip();
+      ctx.imageSmoothingEnabled = true;
+      ctx.globalAlpha = 0.55 + 0.45 * RUN_VIZ.refine;
+      ctx.drawImage(scratch, cx - radius, cy - radius, art, art);
+      ctx.restore();
+
+      // The two opening edges glow, so the growth is visible rather than implied.
+      if (RUN_VIZ.build < 0.995) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.clip();
+        var edge = "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + "," + (0.5 + pulse * 0.4) + ")";
+        var lip = radius * 0.12;
+        var top = ctx.createLinearGradient(0, cy - band - lip, 0, cy - band);
+        top.addColorStop(0, "rgba(0,0,0,0)");
+        top.addColorStop(1, edge);
+        ctx.fillStyle = top;
+        ctx.fillRect(cx - radius, cy - band - lip, art, lip);
+
+        var bottom = ctx.createLinearGradient(0, cy + band, 0, cy + band + lip);
+        bottom.addColorStop(0, edge);
+        bottom.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = bottom;
+        ctx.fillRect(cx - radius, cy + band, art, lip);
+        ctx.restore();
+      }
+    }
+
+    // ------------------------------------------------------------ the ring
+    var ringRadius = radius + Math.max(4, radius * 0.045);
+    var total = RUN_VIZ.build * 0.45 + RUN_VIZ.refine * 0.55;
+
+    ctx.lineWidth = Math.max(2, radius * 0.016);
+    ctx.strokeStyle = "rgba(255,255,255,.07)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringRadius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.lineCap = "round";
+    ctx.lineWidth = Math.max(3, radius * 0.02) + pulse * 2;
+    ctx.strokeStyle = "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + "," + (0.75 + pulse * 0.25) + ")";
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringRadius, -Math.PI / 2, -Math.PI / 2 + Math.max(0.02, total) * Math.PI * 2);
+    ctx.stroke();
+
+    // A comet ahead of the arc: some stages report nothing for a long while,
+    // and a frozen ring reads as a crash.
+    var lead = -Math.PI / 2 + RUN_VIZ.phase * 1.8;
+    ctx.strokeStyle = "rgba(" + second[0] + "," + second[1] + "," + second[2] + ",.45)";
+    ctx.lineWidth = Math.max(2, radius * 0.012);
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringRadius * 0.94, lead, lead + 0.45);
+    ctx.stroke();
+
+    RUN_VIZ.frame = requestAnimationFrame(drawRunViz);
+  }
+
+  function startRunViz(build, refine) {
+    RUN_VIZ.buildTarget = Math.min(1, Math.max(0, build || 0));
+    RUN_VIZ.refineTarget = Math.min(1, Math.max(0, refine || 0));
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    $("coverWrap").classList.add("is-rendering");
+    if (!RUN_VIZ.frame) drawRunViz();
+  }
+
+  function stopRunViz() {
+    $("coverWrap").classList.remove("is-rendering");
+    if (RUN_VIZ.frame) { cancelAnimationFrame(RUN_VIZ.frame); RUN_VIZ.frame = 0; }
+    RUN_VIZ.build = RUN_VIZ.buildTarget = 0;
+    RUN_VIZ.refine = RUN_VIZ.refineTarget = 0;
   }
 
   function startViz() {
@@ -990,6 +1353,9 @@
 
   function stopViz() {
     $("coverWrap").classList.remove("is-playing");
+    VIZ.pulse = 0;
+    var disc = $("coverDisc");
+    if (disc) disc.style.setProperty("--pulse", "0");
     if (VIZ.frame) { cancelAnimationFrame(VIZ.frame); VIZ.frame = 0; }
   }
 
@@ -1132,11 +1498,22 @@
   function paintLibrary() {
     var list = $("libList");
     $("libCount").textContent = STATE.takes.length;
+
+    // A run in progress sits at the top of the list, so it is never lost.
+    var running = "";
+    if (STATE.running) {
+      running = '<article class="take is-running-row" data-run="1" tabindex="0">' +
+        '<div class="take-title">' + escape(STATE.running.title) + "</div>" +
+        '<div class="take-style">generating now — click to watch</div>' +
+        '<div class="take-foot"><span class="tag full">running</span></div></article>';
+    }
+
     if (!STATE.takes.length) {
-      list.innerHTML = '<div class="lib-empty">No takes yet.<br>Every finished song lands here.</div>';
+      list.innerHTML = running ||
+        '<div class="lib-empty">No takes yet.<br>Every finished song lands here.</div>';
       return;
     }
-    list.innerHTML = STATE.takes.map(function (take) {
+    list.innerHTML = running + STATE.takes.map(function (take) {
       var active = STATE.take && STATE.take.name === take.name ? " is-active" : "";
       var thumb = take.has_cover
         ? '<img class="take-thumb" src="/api/library/' + encodeURIComponent(take.name) + '/cover" alt="" />'
@@ -1172,6 +1549,7 @@
       return;
     }
     var card = event.target.closest(".take");
+    if (card && card.dataset.run) { $("backToRun").click(); return; }
     if (card) openTake(card.dataset.name);
   });
 
@@ -1248,7 +1626,9 @@
       paintHardware(data.hardware);
       paintVram(data.vram);
       var live = data.jobs.filter(function (j) { return j.state === "running" || j.state === "queued"; })[0];
-      if (live) paintJob(live);
+      STATE.running = live || null;
+      paintRunReturn();
+      if (live && !STATE.take) paintJob(live);
     }).catch(function () {});
   }
 

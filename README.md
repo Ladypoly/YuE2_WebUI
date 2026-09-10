@@ -11,6 +11,16 @@ Everything runs on your own machine: the song model, the lyric writer, and the c
 ![Code](https://img.shields.io/badge/code-Apache%202.0-blue)
 ![Weights](https://img.shields.io/badge/weights-CC%20BY--NC%204.0-lightgrey)
 
+![A finished take playing, with the spectrum drawn either side of the cover](assets/webui/console-playing.jpg)
+
+*A finished take. The sleeve is a disc in the middle of its own waveform, and the
+spectrum takes its colours from the artwork.*
+
+![A song being generated, the cover resolving as the run progresses](assets/webui/console-running.jpg)
+
+*A run in progress. The cover is drawn before the song, so it is already there while
+the four stages work, sharpening as they go.*
+
 ## Install
 
 Download or clone this repository, then double-click **`install.bat`**.
