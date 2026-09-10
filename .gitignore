@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -11,13 +12,28 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Model weights, never in git. Everything under models/ is downloaded on demand:
+# YuE2 itself, the llama.cpp writers and the cover-art checkpoints.
 models/
-outputs/
-runs/
 *.safetensors
 *.ckpt
 *.pt
 *.pth
+*.gguf
+*.sft
+
+# Runtimes fetched by the console at runtime (a few hundred MB of binaries each)
+llamacpp/
+sdcpp/
+
+# Generated songs, covers and uploaded audio
+outputs/
+runs/
+
+# Local machine state
+webui/settings.json
 *.whl
 *.partial
 .DS_Store
+Thumbs.db
