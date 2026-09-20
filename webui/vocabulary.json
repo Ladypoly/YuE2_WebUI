@@ -20,7 +20,7 @@
  "fields": {
   "genre": {
    "label": "Genre",
-   "hint": "The musical style itself.",
+   "hint": "The musical style. Pick several to blend them.",
    "goes_to": "style",
    "options": [
     "House",
@@ -287,7 +287,10 @@
     "Enka",
     "V-Pop",
     "Hawaiian"
-   ]
+   ],
+   "multi": true,
+   "max": 4,
+   "blend": "blend them into one style rather than taking turns"
   },
   "tempo": {
    "label": "Tempo",
@@ -369,7 +372,7 @@
   },
   "language": {
    "label": "Language",
-   "hint": "The language of the words.",
+   "hint": "The language of the words; two makes it bilingual.",
    "goes_to": "words",
    "options": [
     "English",
@@ -462,11 +465,14 @@
     "Multilingual / mixed",
     "Invented / gibberish language",
     "No lyrics / n/a"
-   ]
+   ],
+   "multi": true,
+   "max": 2,
+   "blend": "mix both languages inside the song"
   },
   "voice": {
    "label": "Voice",
-   "hint": "Who sings, and how.",
+   "hint": "Who sings, and how. Pick two for a duet.",
    "goes_to": "style",
    "options": [
     "female vocal",
@@ -515,11 +521,14 @@
     "spoken word",
     "narrator / voice-over",
     "no vocals / n/a"
-   ]
+   ],
+   "multi": true,
+   "max": 3,
+   "blend": "put them in the same song together, as a duet or as layered vocals"
   },
   "theme": {
    "label": "Lyrics theme",
-   "hint": "What the words are about.",
+   "hint": "What the words are about; several can sit together.",
    "goes_to": "words",
    "options": [
     "love & romance",
@@ -538,7 +547,10 @@
     "friendship & togetherness",
     "melancholy & longing",
     "mystery & darkness"
-   ]
+   ],
+   "multi": true,
+   "max": 3,
+   "blend": "weave them together in the words"
   },
   "length": {
    "label": "Length",

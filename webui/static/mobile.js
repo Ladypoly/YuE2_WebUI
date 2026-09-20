@@ -122,7 +122,21 @@
     Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
       if (select.value) chosen[select.dataset.sheet] = select.value;
     });
+    // A blendable field keeps its picks as chips, in the order they were added.
+    Array.prototype.forEach.call(document.querySelectorAll("[data-chips]"), function (box) {
+      var picked = Array.prototype.map.call(box.querySelectorAll("[data-chip]"), function (chip) {
+        return chip.dataset.chip;
+      });
+      if (picked.length) chosen[box.dataset.chips] = picked;
+    });
     return chosen;
+  }
+
+  function chipsFor(name, values) {
+    return values.map(function (value) {
+      return '<button type="button" class="chip" data-chip="' + escape(value) +
+        '" data-field="' + name + '">' + escape(value) + "<span>×</span></button>";
+    }).join("");
   }
 
   function paintSheetCounts() {
@@ -146,11 +160,23 @@
       var body = group.fields.map(function (name) {
         var field = vocabulary.fields[name];
         if (!field) return "";
-        var options = ['<option value="">any</option>'].concat(field.options.map(function (value) {
+        var options = field.options.map(function (value) {
           return '<option value="' + escape(value) + '">' + escape(value) + "</option>";
-        })).join("");
-        return '<label class="f"><span>' + escape(field.label) + "</span>" +
-               '<select data-sheet="' + name + '">' + options + "</select></label>";
+        }).join("");
+        if (!field.multi) {
+          return '<label class="f"><span>' + escape(field.label) + "</span>" +
+                 '<select data-sheet="' + name + '"><option value="">any</option>' +
+                 options + "</select></label>";
+        }
+        var keep = saved[name];
+        keep = (keep instanceof Array ? keep : (keep ? [keep] : [])).filter(function (value) {
+          return field.options.indexOf(value) >= 0;
+        });
+        return '<label class="f"><span>' + escape(field.label) + " · mix up to " +
+               (field.max || 4) + "</span>" +
+               '<select data-add="' + name + '"><option value="">add one…</option>' +
+               options + "</select>" +
+               '<div class="chips" data-chips="' + name + '">' + chipsFor(name, keep) + "</div></label>";
       }).join("");
       return '<details class="sheet-group"><summary>' + escape(group.title) +
         '<span class="count" id="sheetCount' + index + '" data-on="0"></span></summary>' +
@@ -164,12 +190,39 @@
       }
       select.addEventListener("change", paintSheetCounts);
     });
+
+    Array.prototype.forEach.call(document.querySelectorAll("[data-add]"), function (select) {
+      select.addEventListener("change", function () {
+        var name = this.dataset.add, value = this.value;
+        this.value = "";
+        if (!value) return;
+        var field = vocabulary.fields[name];
+        var current = sheetValues()[name] || [];
+        if (current.indexOf(value) >= 0) return;
+        if (current.length >= (field.max || 4)) {
+          return toast("At most " + (field.max || 4) + " at once", "bad");
+        }
+        document.querySelector('[data-chips="' + name + '"]')
+          .insertAdjacentHTML("beforeend", chipsFor(name, [value]));
+        paintSheetCounts();
+      });
+    });
+
+    $("sheetGroups").addEventListener("click", function (event) {
+      var chip = event.target.closest("[data-chip]");
+      if (!chip) return;
+      chip.parentNode.removeChild(chip);
+      paintSheetCounts();
+    });
     paintSheetCounts();
   }
 
   $("sheetClear").addEventListener("click", function () {
     Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
       select.value = "";
+    });
+    Array.prototype.forEach.call(document.querySelectorAll("[data-chips]"), function (box) {
+      box.innerHTML = "";
     });
     paintSheetCounts();
     toast("Sheet cleared");

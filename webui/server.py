@@ -1007,21 +1007,42 @@ VOCABULARY = json.loads(VOCABULARY_FILE.read_text(encoding="utf-8")) if VOCABULA
 
 
 def clean_sheet(sheet):
-    """Keep the choices that are in the vocabulary, in the vocabulary's order."""
-    given = {str(k): str(v).strip() for k, v in (sheet or {}).items() if str(v).strip()}
+    """Keep the choices that are in the vocabulary, in the vocabulary's order.
+
+    A blendable field arrives as a list and leaves as one, trimmed to its cap;
+    every other field is a single value. Anything not in the vocabulary is
+    dropped rather than passed through to the writer.
+    """
+    given = sheet or {}
     chosen = {}
     for name in VOCABULARY.get("order", []):
-        value = given.get(name)
-        if value and value in VOCABULARY["fields"][name]["options"]:
-            chosen[name] = value
+        field = VOCABULARY["fields"][name]
+        options, value = field["options"], given.get(name)
+        if field.get("multi"):
+            values = value if isinstance(value, list) else ([value] if value else [])
+            kept, seen = [], set()
+            for item in values:
+                item = str(item).strip()
+                if item in options and item not in seen:
+                    seen.add(item)
+                    kept.append(item)
+            if kept:
+                chosen[name] = kept[:int(field.get("max", 4))]
+        elif isinstance(value, (str, int, float)) and str(value).strip() in options:
+            chosen[name] = str(value).strip()
     return chosen
 
 
 def style_from_sheet(sheet):
     """The musical half of the sheet, as a style prompt fragment."""
     chosen = clean_sheet(sheet)
-    parts = [chosen[name] for name in VOCABULARY.get("order", [])
-             if name in chosen and VOCABULARY["fields"][name]["goes_to"] == "style"]
+    parts = []
+    for name in VOCABULARY.get("order", []):
+        if name not in chosen or VOCABULARY["fields"][name]["goes_to"] != "style":
+            continue
+        value = chosen[name]
+        # A style prompt is a list of tags, so a blend is simply several of them.
+        parts.extend(value if isinstance(value, list) else [value])
     return ", ".join(parts)
 
 
@@ -1033,15 +1054,25 @@ def _sheet_request(sheet):
     lines = ["\n\nThe song sheet is already decided. Honour every line of it:"]
     for name, value in chosen.items():
         field = VOCABULARY["fields"][name]
-        lines.append("- %s: %s" % (field["label"], value))
-    if "lyrics" in chosen and chosen["lyrics"] == "instrumental":
+        if isinstance(value, list) and len(value) > 1:
+            # Two genres blend; two voices share a song. The phrasing belongs
+            # to the field, not to this loop.
+            lines.append("- %s: %s -- %s" % (field["label"], ", ".join(value),
+                                             field.get("blend", "combine them")))
+        else:
+            lines.append("- %s: %s" % (field["label"],
+                                       value[0] if isinstance(value, list) else value))
+    if chosen.get("lyrics") == "instrumental":
         lines.append("Write no sung words at all: section tags only, each one instrumental.")
-    elif "lyrics" in chosen and chosen["lyrics"] == "only voice - no words":
+    elif chosen.get("lyrics") == "only voice - no words":
         lines.append("Write wordless vocals: vowels and syllables under the tags, no real words.")
-    elif "lyrics" in chosen and chosen["lyrics"] == "sparse":
+    elif chosen.get("lyrics") == "sparse":
         lines.append("Keep the words sparse: a handful of short lines, plenty of instrumental room.")
-    if "language" in chosen and not chosen["language"].startswith(("English", "No lyrics")):
-        lines.append("Write the lyrics in that language, and keep the section tags in English.")
+    spoken = chosen.get("language")
+    spoken = spoken if isinstance(spoken, list) else ([spoken] if spoken else [])
+    if any(not name.startswith(("English", "No lyrics")) for name in spoken):
+        lines.append("Write the lyrics in %s, and keep the section tags in English."
+                     % (" and ".join(spoken) if len(spoken) > 1 else "that language"))
     lines.append("Name the genre, tempo, key, meter and voice in the style prompt too, "
                  "in that order, before the instrument and production words.")
     return "\n".join(lines)

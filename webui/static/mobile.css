@@ -127,6 +127,17 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--amber-dim);
 .sheet-group .count { font: 400 12px/1 var(--mono); color: var(--dim); }
 .sheet-group .count[data-on="1"] { color: var(--patina); }
 .sheet-body { padding: 2px 14px 6px; }
+/* Blendable fields keep their picks as chips; tapping one removes it. */
+.chips { display: flex; flex-wrap: wrap; gap: 7px; margin: 8px 0 2px; }
+.chips:empty { margin: 0; }
+.chip {
+  display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 12px;
+  font: 500 13px/1 var(--sans); color: var(--ink); cursor: pointer;
+  background: var(--raise); border: 1px solid var(--line); border-radius: 999px;
+}
+.chip span { color: var(--dim); font-size: 16px; line-height: 1; }
+.chip:active { border-color: var(--amber); }
+
 .sheet-actions { display: flex; gap: 8px; margin-bottom: 14px; }
 .sheet-actions .btn { margin-bottom: 0; }
 

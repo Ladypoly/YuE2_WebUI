@@ -450,7 +450,21 @@
     Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
       if (select.value) chosen[select.dataset.sheet] = select.value;
     });
+    // A blendable field keeps its picks as chips, in the order they were added.
+    Array.prototype.forEach.call(document.querySelectorAll("[data-chips]"), function (box) {
+      var picked = Array.prototype.map.call(box.querySelectorAll("[data-chip]"), function (chip) {
+        return chip.dataset.chip;
+      });
+      if (picked.length) chosen[box.dataset.chips] = picked;
+    });
     return chosen;
+  }
+
+  function chipsFor(name, values) {
+    return values.map(function (value) {
+      return '<button type="button" class="chip" data-chip="' + escape(value) +
+        '" data-field="' + name + '" title="Remove">' + escape(value) + "<span>×</span></button>";
+    }).join("");
   }
 
   function paintSheetCount() {
@@ -460,19 +474,33 @@
     try { localStorage.setItem("yue2.sheet", JSON.stringify(sheetValues())); } catch (error) {}
   }
 
+  var savedSheet = {};
+
   function buildSheet(vocabulary) {
     STATE.vocabulary = vocabulary;
     var saved = {};
     try { saved = JSON.parse(localStorage.getItem("yue2.sheet") || "{}"); } catch (error) {}
+    savedSheet = saved;
     $("sheetGrid").innerHTML = vocabulary.order.map(function (name) {
       var field = vocabulary.fields[name];
-      var options = ['<option value="' + SHEET_NONE + '">let the writer decide</option>'].concat(
-        field.options.map(function (value) {
-          return '<option value="' + escape(value) + '">' + escape(value) + "</option>";
-        })).join("");
-      return '<label class="field"><span class="label">' + escape(field.label) +
-        (field.hint ? "<em>" + escape(field.hint) + "</em>" : "") + "</span>" +
-        '<select data-sheet="' + name + '">' + options + "</select></label>";
+      var head = '<span class="label">' + escape(field.label) +
+        (field.hint ? "<em>" + escape(field.hint) + "</em>" : "") + "</span>";
+      var options = field.options.map(function (value) {
+        return '<option value="' + escape(value) + '">' + escape(value) + "</option>";
+      }).join("");
+      if (!field.multi) {
+        return '<label class="field">' + head +
+          '<select data-sheet="' + name + '"><option value="' + SHEET_NONE +
+          '">let the writer decide</option>' + options + "</select></label>";
+      }
+      var keep = savedSheet[name];
+      keep = (keep instanceof Array ? keep : (keep ? [keep] : [])).filter(function (value) {
+        return field.options.indexOf(value) >= 0;
+      });
+      return '<label class="field">' + head +
+        '<select data-add="' + name + '"><option value="' + SHEET_NONE + '">add one…</option>' +
+        options + "</select>" +
+        '<div class="chips" data-chips="' + name + '">' + chipsFor(name, keep) + "</div></label>";
     }).join("");
     Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
       var name = select.dataset.sheet;
@@ -480,6 +508,31 @@
         select.value = saved[name];
       }
       select.addEventListener("change", paintSheetCount);
+    });
+
+    // Picking from a blendable field adds a chip and hands the list back.
+    Array.prototype.forEach.call(document.querySelectorAll("[data-add]"), function (select) {
+      select.addEventListener("change", function () {
+        var name = this.dataset.add, value = this.value;
+        this.value = SHEET_NONE;
+        if (!value) return;
+        var box = document.querySelector('[data-chips="' + name + '"]');
+        var field = vocabulary.fields[name];
+        var current = sheetValues()[name] || [];
+        if (current.indexOf(value) >= 0) return;
+        if (current.length >= (field.max || 4)) {
+          return toast("At most " + (field.max || 4) + " " + field.label.toLowerCase() + " at once", "bad");
+        }
+        box.insertAdjacentHTML("beforeend", chipsFor(name, [value]));
+        paintSheetCount();
+      });
+    });
+
+    $("sheetGrid").addEventListener("click", function (event) {
+      var chip = event.target.closest("[data-chip]");
+      if (!chip) return;
+      chip.parentNode.removeChild(chip);
+      paintSheetCount();
     });
     paintSheetCount();
   }
@@ -499,6 +552,9 @@
   $("sheetClear").addEventListener("click", function () {
     Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
       select.value = SHEET_NONE;
+    });
+    Array.prototype.forEach.call(document.querySelectorAll("[data-chips]"), function (box) {
+      box.innerHTML = "";
     });
     paintSheetCount();
   });
