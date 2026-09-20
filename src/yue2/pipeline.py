@@ -121,7 +121,8 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True):
+                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
+                 loras=()):
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
@@ -129,6 +130,10 @@ class YuE2Pipeline:
             raise ValueError("backend must be torch, torch-eager, or vllm")
         if quantization not in {"none", "fp8"}:
             raise ValueError("quantization must be none or fp8")
+        self.loras = [dict(entry) if isinstance(entry, dict) else {"path": str(entry)}
+                      for entry in (loras or ())]
+        if self.loras and backend == "vllm":
+            raise ValueError("LoRA adapters need the torch backend; vllm loads its own weights")
         if not 0 < memory_budget_gib:
             raise ValueError("memory_budget_gib must be positive")
         if device == "auto":
@@ -216,6 +221,13 @@ class YuE2Pipeline:
                 self._model = YuE2ForCausalLM.from_pretrained(self.model_dir, local_files_only=True,
                               torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
                 self.load_timing["mot_load_seconds"] = time.perf_counter() - start
+            if self.loras and not getattr(self._model, "_yue2_loras", None):
+                # On the load device: one adapter is a few hundred matrix products,
+                # which is seconds on a GPU and minutes on a CPU.
+                from .lora import apply_loras
+                self._model.to(self.device)
+                with self._status("Merging adapters"):
+                    self.weights["loras"] = apply_loras(self._model, self.loras, self.device)
             if self.quantization == "fp8" and not for_nar:
                 from .quantization import prepare_fp8_ar
                 prepare_fp8_ar(self._model, self.device)
@@ -300,6 +312,7 @@ class YuE2Pipeline:
             result = synthesize(model, semantic.plan.prefix, semantic.tokens,
                                 semantic.plan.request.seed, steps=self.generation_config.ode_steps,
                                 context=self.generation_config.context, offload_ar=self.offload_ar,
+                                method=self.generation_config.ode_method,
                                 cancelled=cancelled, on_progress=report)
             return result.detach().float().cpu().numpy()
 

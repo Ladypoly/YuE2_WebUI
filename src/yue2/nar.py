@@ -166,30 +166,48 @@ class CachedNAR:
             x = x + layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
         return model.llm2vae(model.model.norm(x))[0, 1:-1]
 
+    @staticmethod
+    def _raw_t(t):
+        return torch.logit(torch.tensor(t, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
+
     @torch.inference_mode()
     def solve(self, steps=32, cancelled: Callable[[], bool] | None = None,
-              on_progress: Callable[[int, int], None] | None = None):
-        """Solve a chunk, reporting each submitted midpoint step without syncing.
+              on_progress: Callable[[int, int], None] | None = None, method="midpoint"):
+        """Solve a chunk, reporting each submitted step without syncing.
 
         CUDA work may still be executing when ``on_progress`` runs. The existing
         CPU result transfer completes that work before this method returns.
         Callback exceptions propagate to the caller.
+
+        ``midpoint`` is the release protocol and evaluates the model twice a
+        step. ``dpmpp_2m`` is the second-order multistep alternative: it keeps
+        the previous step's velocity instead of taking a probe evaluation, so a
+        step costs one evaluation. On this uniform grid its correction is the
+        familiar 3/2 and -1/2 pair, and the first step, having no history, is
+        plain Euler.
         """
         if isinstance(steps, bool) or not isinstance(steps, Integral) or steps < 1:
             raise ValueError("steps must be a positive integer")
+        if method not in ("midpoint", "dpmpp_2m"):
+            raise ValueError("method must be midpoint or dpmpp_2m")
         state = self.chunk.noise.to(device=self.device, dtype=self.dtype)
         dt = 1.0 / steps
+        previous = None
         for step in range(steps):
             if cancelled is not None and cancelled():
                 raise InterruptedError("Cancelled during acoustic flow matching")
             t = 1.0 - step * dt
-            raw = torch.logit(torch.tensor(t, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
-            first = self.velocity(state, raw)
-            mid = state - first * (dt / 2)
-            if cancelled is not None and cancelled():
-                raise InterruptedError("Cancelled during acoustic flow matching")
-            raw_mid = torch.logit(torch.tensor(t - dt / 2, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
-            state = state - self.velocity(mid, raw_mid) * dt
+            current = self.velocity(state, self._raw_t(t))
+            if method == "midpoint":
+                mid = state - current * (dt / 2)
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("Cancelled during acoustic flow matching")
+                state = state - self.velocity(mid, self._raw_t(t - dt / 2)) * dt
+            elif previous is None:
+                state = state - current * dt
+            else:
+                state = state - (current * 1.5 - previous * 0.5) * dt
+            previous = current
             if on_progress is not None:
                 on_progress(step + 1, int(steps))
         result = state.float().cpu()
@@ -227,14 +245,14 @@ def _offload_ar(model, enabled):
 @torch.inference_mode()
 def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                steps=32, context=CONTEXT, attention="sdpa", offload_ar=False,
-               cancelled=None, query_chunk_size=None,
+               cancelled=None, query_chunk_size=None, method="midpoint",
                on_progress: Callable[[int, int], None] | None = None):
     """Return CPU FP32 [frames,64] latents, solving original chunks serially.
 
     Defaults preserve the release protocol. Explicit steps/context overrides
     belong in the caller's effective configuration record. ``offload_ar`` is
     an optional memory tradeoff and requires exclusive access to ``model``.
-    Progress counts submitted midpoint steps across all original chunks; it
+    Progress counts submitted solver steps across all original chunks; it
     introduces no device synchronization. Callback exceptions propagate after
     the current chunk's cache is released and any offloaded weights restored.
     """
@@ -254,7 +272,7 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                 if on_progress is not None:
                     def progress(completed, total):
                         on_progress(chunk_index * total + completed, total * len(chunks))
-                output.append(engine.solve(steps, cancelled, on_progress=progress))
+                output.append(engine.solve(steps, cancelled, on_progress=progress, method=method))
             finally:
                 engine.close()
         del engine

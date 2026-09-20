@@ -108,6 +108,37 @@ def test_midpoint_solution_matches_dense_original_solver_and_prefills_once(model
     assert actual.dtype == torch.float32 and actual.device.type == "cpu" and not actual.requires_grad
 
 
+def test_multistep_solution_matches_the_dense_reference(model):
+    chunk = nar.Chunk([2, 3, 4, 5], torch.randn((3, 64), generator=torch.Generator().manual_seed(381)))
+    engine = nar.CachedNAR(model, chunk)
+    actual = engine.solve(steps=4, method="dpmpp_2m")
+    expected, dt, previous = chunk.noise.clone(), 1 / 4, None
+    for step in range(4):
+        t = 1 - step * dt
+        raw = torch.logit(torch.tensor(t, dtype=torch.float64)).clamp(-20, 20).item()
+        current = dense_velocity(model, chunk, expected, raw)
+        step_delta = current if previous is None else current * 1.5 - previous * 0.5
+        expected = expected - step_delta * dt
+        previous = current
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=2e-5)
+
+
+def test_multistep_costs_one_evaluation_a_step(model):
+    noise = torch.zeros((2, 64))
+    engine = nar.CachedNAR(model, nar.Chunk([2, 3], noise))
+    with patch.object(engine, "velocity", return_value=torch.ones_like(noise)) as velocity:
+        actual = engine.solve(steps=6, method="dpmpp_2m")
+    assert velocity.call_count == 6
+    # A constant velocity leaves the correction term with nothing to correct.
+    torch.testing.assert_close(actual, -torch.ones_like(noise), atol=1e-6, rtol=0)
+
+
+def test_unknown_solver_is_refused(model):
+    engine = nar.CachedNAR(model, nar.Chunk([2, 3], torch.zeros((2, 64))))
+    with pytest.raises(ValueError, match="midpoint or dpmpp_2m"):
+        engine.solve(steps=2, method="euler")
+
+
 def test_default_is_32_midpoint_steps(model):
     noise = torch.zeros((2, 64))
     engine = nar.CachedNAR(model, nar.Chunk([2, 3], noise))

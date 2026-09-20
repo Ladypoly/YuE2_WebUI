@@ -41,18 +41,26 @@ class Sampling:
             raise ValueError("Require 0 <= min_tokens <= max_tokens")
 
 
+ODE_METHODS = ("midpoint", "dpmpp_2m")
+
+
 @dataclass(frozen=True)
 class GenerationConfig:
     abc: Sampling = field(default_factory=lambda: Sampling(.7, .9, 30, 1.005, 100, 32, 4096))
     semantic: Sampling = field(default_factory=Sampling)
     ode_steps: int = 32
+    # midpoint is the release protocol: two model evaluations a step. dpmpp_2m
+    # is an opt-in second-order multistep solver that reuses the previous
+    # velocity instead, so a step costs one evaluation. Unvalidated for quality.
     ode_method: str = "midpoint"
     context: int = CONTEXT
     version: str = PROTOCOL_VERSION
 
     def __post_init__(self):
-        if self.context != CONTEXT or self.ode_method != "midpoint" or type(self.ode_steps) is not int or self.ode_steps < 1:
-            raise ValueError("Require context=24576 and midpoint with positive integer steps")
+        if self.context != CONTEXT or type(self.ode_steps) is not int or self.ode_steps < 1:
+            raise ValueError("Require context=24576 and a positive integer number of steps")
+        if self.ode_method not in ODE_METHODS:
+            raise ValueError("ode_method must be one of " + ", ".join(sorted(ODE_METHODS)))
 
     def to_dict(self):
         return asdict(self)

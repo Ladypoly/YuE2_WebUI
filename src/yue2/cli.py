@@ -34,7 +34,16 @@ def get_pipe(args):
              backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar,
              local_files_only=args.offline, generation_config=config,
              vae_core_frames=512 if args.budget <= 12 else 1024,
+             loras=[parse_lora(value) for value in (args.lora or [])],
              progress=not getattr(args, "quiet", False))
+
+
+def parse_lora(value):
+    """PATH or PATH:STRENGTH, with Windows drive letters left alone."""
+    head, sep, tail = str(value).rpartition(":")
+    if sep and head and len(head) > 1:
+        return {"path": head, "strength": float(tail)}
+    return {"path": str(value), "strength": 1.0}
 
 
 def request_kwargs(data, base=Path.cwd()):
@@ -196,6 +205,8 @@ def parser():
         q.add_argument("--budget", type=float, default=24)
         q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
         q.add_argument("--quantization", choices=("none", "fp8"), default="none")
+        q.add_argument("--lora", action="append", metavar="PATH[:STRENGTH]",
+                       help="Merge a NAR LoRA adapter; repeat for several")
         q.add_argument("--offload-ar", action="store_true")
         q.add_argument("--offline", action="store_true")
         q.add_argument("--config")
