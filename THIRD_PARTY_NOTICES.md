@@ -10,6 +10,14 @@ the checkpoint's original inference implementation.
 - SnakeBeta / BigVGAN: Copyright (c) 2022 NVIDIA CORPORATION, MIT.
   Full text: `licenses/SnakeBeta-NVIDIA-MIT.txt`.
 
+The field vocabulary in `webui/vocabulary.json` — the genre, tempo, meter, key,
+lyrics, language, voice, theme and length lists offered by the console's song
+sheet — is taken from the structured prompt node of
+ComfyUI-MiniMax-Music-Production-Toolkit 3.1.2.
+
+- ComfyUI-MiniMax-Music-Production-Toolkit: Copyright (c) Johannes Plenio, MIT.
+  Source: https://github.com/jplenio/ComfyUI-MiniMax-Music-Production-Toolkit
+
 These notices cover the identified source code and retain its original licenses.
 The YuE2 model checkpoint weights are separately licensed under CC BY-NC 4.0;
 see MODEL_LICENSE for the scope and full terms. This does not relicense third-party code.

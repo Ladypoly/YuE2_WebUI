@@ -11,6 +11,18 @@
 </head>
 <body>
 
+<!-- ------------------------------------------------------------- pin gate -->
+<div class="pin-gate is-hidden" id="pinGate">
+  <form class="pin-card" id="pinForm">
+    <h2>Console PIN</h2>
+    <p class="hint" id="pinHint">This console is reached over the network, so it asks for its PIN.
+      It is printed in the window where the console was started, and under Engine on that machine.</p>
+    <input type="text" id="pinInput" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+           autocomplete="one-time-code" placeholder="000000" />
+    <button type="submit" class="btn">Unlock</button>
+  </form>
+</div>
+
 <!-- ---------------------------------------------------------------- topbar -->
 <header class="topbar">
   <div class="brand">
@@ -69,7 +81,110 @@
         <label class="field"><span class="label">VRAM budget</span><input type="number" id="setBudget" step="any" /></label>
         <label class="field"><span class="label">ODE steps</span><input type="number" id="setOde" step="any" /></label>
       </div>
+      <label class="field"><span class="label">Acoustic solver<em>midpoint is the released protocol</em></span>
+        <select id="setOdeMethod">
+          <option value="midpoint">midpoint (2 evaluations a step)</option>
+          <option value="dpmpp_2m">dpmpp_2m (1 evaluation a step, experimental)</option>
+        </select>
+      </label>
       <label class="check"><input type="checkbox" id="setOffload" /> <span>Offload the language model during synthesis</span></label>
+    </div>
+
+    <div class="card wide">
+      <h3>Phone access</h3>
+      <div class="pane-head">
+        <h4 class="mini">On this network</h4>
+        <span class="pill" id="netState">checking</span>
+        <div class="spacer"></div>
+      </div>
+      <p class="hint">Start the console with <code>.\webui\start.ps1 -Lan</code> and it answers on
+        your Wi-Fi as well, so you can write a song, watch a run and listen to takes from a phone.
+        The API then asks for a six-digit PIN. Keep it to your own network: this is plain HTTP, and
+        the PIN is a front-door lock, not a security system. Do not forward the port on your router.</p>
+      <label class="check"><input type="checkbox" id="setLanAccess" />
+        <span><strong>Answer on the network</strong> — needed for phone access; takes effect when
+          the console is restarted</span></label>
+      <div class="model-list" id="netUrls"></div>
+    </div>
+
+    <div class="card wide">
+      <h3>Adapters</h3>
+      <p class="hint">LoRA adapters change the acoustic half of the model — the part that turns the
+        written score into sound — so they shape the voice and the mix, not the composition. They are
+        merged into the weights when the model loads, which costs nothing per song but means a change
+        here reloads it. PyTorch engine only: audio.cpp reads GGUF weights and cannot take them.</p>
+
+      <div class="writer-pane" id="paneLoras">
+        <div class="pane-head">
+          <h4 class="mini">Installed</h4>
+          <span class="pill" id="loraState">none active</span>
+          <div class="spacer"></div>
+        </div>
+        <div class="field-row">
+          <label class="field grow"><span class="label">Look in <em>your ComfyUI loras folder, or any other</em></span>
+            <input type="text" id="loraDir" placeholder="C:\ComfyUI\models\loras\YuE2" /></label>
+          <div class="field reset-cell"><button type="button" class="btn ghost" id="loraDirAdd">Add folder</button></div>
+        </div>
+        <p class="row-hint" id="loraDirs"></p>
+        <div class="model-list" id="loraList"></div>
+      </div>
+    </div>
+
+    <div class="card wide">
+      <h3>Song engine</h3>
+      <p class="hint">The PyTorch engine keeps the model in VRAM in bf16 and wants about 12.5 GiB.
+        audio.cpp runs the same model from quantized GGUF weights in its own process — about
+        7.8 GiB at q4_0 — and gives every byte back when the take is done. Neither engine makes a
+        song longer than the model's own ceiling; the small one reaches it on a smaller card.</p>
+
+      <label class="field"><span class="label">Engine</span>
+        <select id="setSongEngine">
+          <option value="torch">PyTorch (bf16 safetensors)</option>
+          <option value="gguf">audio.cpp (GGUF, quantized)</option>
+        </select>
+      </label>
+
+      <div class="writer-pane" id="paneGguf">
+        <div class="pane-head">
+          <h4 class="mini">audio.cpp</h4>
+          <span class="pill" id="ggufState">checking</span>
+          <div class="spacer"></div>
+          <button type="button" class="btn ghost small" id="ggufInstall">Install audio.cpp</button>
+        </div>
+        <p class="hint" id="ggufHint">Downloads a prebuilt CUDA build into the project folder.
+          YuE2 reached audio.cpp's dev branch after its last release, so until the next one lands
+          this needs a build of your own: put the path below.</p>
+
+        <label class="field"><span class="label">Your own audiocpp_cli <em>leave empty to use the one installed here</em></span>
+          <input type="text" id="setAudiocppBin" placeholder="D:\audio.cpp\build\bin\audiocpp_cli.exe" /></label>
+
+        <div class="field-row">
+          <label class="field"><span class="label">Weights</span>
+            <select id="setGgufMain">
+              <option value="q4_0">q4_0 · 2.5 GB · ~7.8 GiB VRAM</option>
+              <option value="q8_0">q8_0 · 4.0 GB · ~8.9 GiB VRAM</option>
+              <option value="bf16">bf16 · 6.8 GB · ~12.5 GiB VRAM</option>
+            </select>
+          </label>
+          <label class="field"><span class="label">Decoder</span>
+            <select id="setGgufVae">
+              <option value="f16">f16 (smaller)</option>
+              <option value="f32">f32 (full precision)</option>
+            </select>
+          </label>
+          <label class="field"><span class="label">Compute</span>
+            <select id="setGgufBackend">
+              <option value="cuda">cuda</option>
+              <option value="vulkan">vulkan</option>
+              <option value="cpu">cpu</option>
+            </select>
+          </label>
+          <label class="field"><span class="label">Threads</span>
+            <input type="number" id="setGgufThreads" min="1" step="1" /></label>
+        </div>
+        <p class="row-hint" id="ggufWeightsHint"></p>
+        <div class="model-list" id="ggufCatalog"></div>
+      </div>
     </div>
 
     <div class="card wide">
@@ -190,6 +305,18 @@
         </label>
       </div>
       <p class="row-hint" id="structureHint"></p>
+
+      <details class="sheet" id="sheet">
+        <summary><span>Song sheet</span><span class="sheet-count" id="sheetCount">nothing picked</span></summary>
+        <p class="hint">Anything you pick here the writer has to honour, and the musical half goes
+          into the style prompt. Leave a field on <em>let the writer decide</em> and it is not
+          mentioned at all.</p>
+        <div class="sheet-grid" id="sheetGrid"></div>
+        <div class="sheet-foot">
+          <button type="button" class="btn ghost small" id="sheetToStyle">Put the musical half in the style box</button>
+          <button type="button" class="btn ghost small" id="sheetClear">Clear the sheet</button>
+        </div>
+      </details>
       <div class="muse-foot">
         <label class="check"><input type="checkbox" id="autoRun" />
           <span><strong>Write and generate</strong> — go straight on to the song</span></label>

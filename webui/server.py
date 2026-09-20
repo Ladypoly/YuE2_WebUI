@@ -16,20 +16,24 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-# Set before torch is ever imported: the allocator otherwise fragments across a
-# run and a late 1.4 GiB attention block fails while gigabytes sit reserved.
+# Set before torch is ever imported. Windows ignores expandable_segments -- torch
+# says so at load -- but the variable is harmless there and helps on Linux.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
 OUTPUTS = Path(os.environ.get("YUE2_OUTPUTS", ROOT / "outputs")).resolve()
 OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
 VAE_CHOICES = {"standard": "m-a-p/YuE2-Vae", "legacy": "m-a-p/YuE2-Vae-legacy"}
 
@@ -94,9 +98,23 @@ class Settings:
     device: str = "auto"
     backend: str = "torch"
     quantization: str = "none"
+    song_engine: str = "torch"          # torch (safetensors) | gguf (audio.cpp)
+    gguf_main: str = "q4_0"             # q4_0 | q8_0 | bf16
+    gguf_vae: str = "f16"               # f16 | f32
+    gguf_backend: str = "cuda"          # audio.cpp compute backend
+    gguf_threads: int = 8
+    audiocpp_bin: str = ""              # your own audiocpp_cli, if you built one
+    lan_access: bool = False            # answer on the network, not just this machine
+    align_model: str = "openai/whisper-small"   # listens to a take to time its words
+    access_pin: str = ""                # set when the console is put on the network
+    loras: list = dataclasses.field(default_factory=list)   # [{path, strength}]
+    lora_dirs: list = dataclasses.field(default_factory=list)
     memory_budget_gib: float = 0.0      # 0 = follow the card
     offload_ar: bool = True
-    ode_steps: int = 32
+    # The console's own defaults. The library keeps the released protocol
+    # (midpoint, 32) for the CLI and for anything reproducing a paper result.
+    ode_steps: int = 6
+    ode_method: str = "dpmpp_2m"
     offline: bool = False
     ollama_url: str = "http://127.0.0.1:11434"
     muse_model: str = ""
@@ -106,6 +124,7 @@ class Settings:
     llamacpp_gpu_layers: int = 999
     art_model: str = ""
     art_auto: bool = False
+    stall_timeout: int = 300            # seconds without progress before a run is cut, 0 = off
     writer_dirs: list = dataclasses.field(default_factory=list)
     art_dirs: list = dataclasses.field(default_factory=list)
 
@@ -124,6 +143,12 @@ if SETTINGS_FILE.is_file():
 
 def save_settings():
     SETTINGS_FILE.write_text(json.dumps(SETTINGS.to_dict(), indent=2), encoding="utf-8")
+
+
+# Where to listen. YUE2_HOST wins, so a launcher can still force it; otherwise
+# the saved setting decides, which is what a double-clicked shortcut follows.
+BIND_HOST = os.environ.get("YUE2_HOST") or ("0.0.0.0" if SETTINGS.lan_access else "127.0.0.1")
+BIND_PORT = int(os.environ.get("YUE2_PORT", "7865"))
 
 
 # --------------------------------------------------------------------------- engine
@@ -210,10 +235,15 @@ class Engine:
 
     def ensure(self):
         budget = resolved_budget()
+        sync_model_dirs()
+        adapters, missing = LORAS.resolve(SETTINGS.loras)
+        if missing:
+            raise RuntimeError("These adapters are no longer on disk: " + ", ".join(missing))
         want = {"model": SETTINGS.model, "vae": SETTINGS.vae, "device": SETTINGS.device,
                 "backend": SETTINGS.backend, "quantization": SETTINGS.quantization,
                 "memory_budget_gib": budget, "offload_ar": SETTINGS.offload_ar,
-                "ode_steps": SETTINGS.ode_steps, "offline": SETTINGS.offline}
+                "ode_steps": SETTINGS.ode_steps, "ode_method": SETTINGS.ode_method,
+                "offline": SETTINGS.offline, "loras": adapters}
         if self.pipe is not None and self.loaded_with == want:
             return self.pipe
         self.unload()
@@ -223,7 +253,8 @@ class Engine:
         self.status = "loading"
         self.detail = "Loading YuE2"
         BUS.publish("engine", self.describe())
-        config = dataclasses.replace(GenerationConfig(), ode_steps=int(SETTINGS.ode_steps))
+        config = dataclasses.replace(GenerationConfig(), ode_steps=int(SETTINGS.ode_steps),
+                                     ode_method=SETTINGS.ode_method)
         pipe = YuE2Pipeline.from_pretrained(
             bundled_or_hub(SETTINGS.model),
             vae=bundled_or_hub(VAE_CHOICES.get(SETTINGS.vae, SETTINGS.vae)),
@@ -234,6 +265,7 @@ class Engine:
             memory_budget_gib=budget,
             offload_ar=SETTINGS.offload_ar,
             generation_config=config,
+            loras=adapters,
             progress=True,
         )
         self.pipe = pipe
@@ -267,6 +299,8 @@ class Job:
         self.setup = ""
         self.setup_at = None
         self.cover_ready = False
+        self.last_progress = time.time()
+        self.stalled = False
         self.abc_partial = ""
         self.abc_tokens = []
         self._last_push = 0.0
@@ -280,7 +314,8 @@ class Job:
                 "title": self.spec.get("title") or self.spec.get("id") or "Untitled take",
                 "seed": self.spec.get("seed"), "cot": self.spec.get("cot"),
                 "stages": list(self.stages.values()), "abc_partial": self.abc_partial,
-                "cover_ready": self.cover_ready}
+                "cover_ready": self.cover_ready, "stalled": self.stalled,
+                "idle_seconds": round(time.time() - self.last_progress, 1)}
 
     def push(self, force=False):
         now = time.monotonic()
@@ -292,6 +327,8 @@ class Job:
 JOBS = {}
 JOB_ORDER = []
 WORK = queue.Queue()
+# The one run the worker is on, so the watchdog can see it.
+CURRENT = {"job": None}
 
 
 class _StageProxy:
@@ -316,6 +353,7 @@ class _StageProxy:
         if self.key is None:
             return
         self.job.stages[self.key]["seconds"] = time.monotonic() - self.start
+        self.job.last_progress = time.time()
         self.job.push(force=force)
 
     def advance(self, count=1):
@@ -380,28 +418,176 @@ def is_oom(exc):
     return "out of memory" in str(exc).lower()
 
 
-def run_job(job):
-    from yue2.protocol import GenerationConfig
+class _GgufStages:
+    """audio.cpp reports a phase as it ends, so the console runs one stage at a
+    time and only the two chunked phases can fill a bar."""
 
-    job.state = "running"
-    job.started = time.time()
-    job.push(force=True)
-    ENGINE.status = "busy"
-    BUS.publish("engine", ENGINE.describe())
-    spec = job.spec
+    ORDER = ["plan", "semantic", "synthesize", "decode"]
 
-    if SETTINGS.art_auto and spec.get("cover") and ART.exe() is not None and art_model_path():
-        # The GPU is free right now; once YuE2 loads it is busy for minutes.
-        job.setup = "Drawing the cover"
+    def __init__(self, job, cot, provided_score):
+        self.job = job
+        self.start = 0.0
+        self.current = None
+        # With no score of your own, the plan is only finished once the model has
+        # written one: audio.cpp counts the prompt's ABC tokens before that.
+        self.plan_marker = ("yue2.plan.abc_tokens" if provided_score
+                            else "yue2.semantic.abc_generated_tokens")
+        self.begin("semantic" if cot == "off" else "plan")
+
+    def begin(self, key):
+        if key is None:
+            return
+        self.current = key
+        self.start = time.monotonic()
+        entry = self.job.stages[key]
+        entry.update(state="running", completed=0, total=None, unit=None, seconds=0.0)
+        self.job.stage = key
+        self.job.setup = ""
+        self.job.setup_at = None
+        self.job.last_progress = time.time()
+        self.job.push(force=True)
+
+    def on_phase(self, key, event, value, marker=None):
+        if key == "plan" and marker != self.plan_marker:
+            return
+        if event == "tick":
+            if self.current is None:
+                return
+            entry = self.job.stages[self.current]
+            entry["completed"] += 1
+            entry["unit"] = "chunks" if self.current == "synthesize" else "tiles"
+            entry["seconds"] = time.monotonic() - self.start
+            self.job.last_progress = time.time()
+            self.job.push()
+            return
+        entry = self.job.stages[key]
+        if entry["state"] == "completed":
+            # A phase can report twice; the second report must not restart the next.
+            return
+        entry["seconds"] = time.monotonic() - self.start
+        entry["state"] = "completed"
+        if key == "semantic" and isinstance(value, float):
+            entry["completed"] = int(value)
+            entry["unit"] = "tokens"
+        following = self.ORDER.index(key) + 1
+        self.job.last_progress = time.time()
+        self.begin(self.ORDER[following] if following < len(self.ORDER) else None)
+        self.job.push(force=True)
+
+    def finish(self):
+        for key in self.ORDER:
+            entry = self.job.stages[key]
+            if entry["state"] == "running":
+                entry["state"] = "completed"
+        self.job.push(force=True)
+
+
+class GgufSong:
+    """What audio.cpp gives back, in the shape the library already reads."""
+
+    def __init__(self, spec, wav, timing, abc, weights):
+        self.spec = spec
+        self.wav = Path(wav)
+        self.timing = timing
+        self.abc = abc or ""
+        self.weights = weights
+
+    @property
+    def truncated(self):
+        return {"abc": bool(self.timing.get("yue2.semantic.abc_truncated")),
+                "semantic": bool(self.timing.get("yue2.semantic.truncated"))}
+
+    def save_artifacts(self, directory):
+        import soundfile as sf
+        from yue2.storage import collect_hashes, identity, write_json
+
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        audio, rate = sf.read(str(self.wav), dtype="float32", always_2d=True)
+        sf.write(directory / "audio.flac", audio, rate, subtype="PCM_24")
+        self.wav.unlink(missing_ok=True)
+        if self.wav.parent.name.startswith(".pending-"):
+            shutil.rmtree(self.wav.parent, ignore_errors=True)
+        if self.abc:
+            (directory / "score.abc").write_text(self.abc, encoding="utf-8")
+        request = {"style": self.spec["style"], "lyrics": self.spec["lyrics"],
+                   "cot": self.spec.get("cot", "full"), "seed": int(self.spec["seed"]),
+                   "abc": self.spec.get("abc") or None, "cfg_scale": self.spec.get("cfg_scale"),
+                   "id": self.spec.get("id", "song")}
+        write_json(directory / "request.json", request)
+        write_json(directory / "config.json", {"engine": "gguf", "runtime": "audio.cpp",
+                                               **self.weights})
+        result = {"status": "complete", "identity": identity(request),
+                  "truncated": self.truncated, "sample_rate": rate,
+                  "audio_seconds": len(audio) / rate,
+                  "weights": self.weights, "timing": self.timing,
+                  "artifacts": collect_hashes(directory)}
+        write_json(directory / "result.json", result)
+        return result
+
+
+def _vram_hint(main_id):
+    return next((e["vram_gib"] for e in GGUF_WEIGHTS if e["id"] == main_id), 12.5)
+
+
+def render_gguf(job, spec):
+    """Run the take in audio.cpp so quantized weights can hold a whole song."""
+    # The separate process needs the VRAM the PyTorch pipeline is still holding.
+    ENGINE.unload()
+    weights = {"main": SETTINGS.gguf_main, "vae": SETTINGS.gguf_vae,
+               "backend": SETTINGS.gguf_backend, "threads": int(SETTINGS.gguf_threads),
+               "ode_steps": int(SETTINGS.ode_steps)}
+    if SETTINGS.loras:
+        raise RuntimeError("audio.cpp loads GGUF weights and cannot merge adapters. "
+                           "Switch the song engine back to PyTorch to use them, or clear "
+                           "the adapter selection under Engine.")
+    status = SONG.status(weights["main"], weights["vae"])
+    if not status["installed"]:
+        raise RuntimeError("The GGUF engine is selected but audio.cpp is not installed. "
+                           "Install it under Engine, or point the console at your own build.")
+    if not status["yue2"]:
+        raise RuntimeError("This audiocpp_cli build has no YuE2 family. Install a newer build "
+                           "under Engine, or point the console at one built from the dev branch.")
+    if not status["weights_ready"]:
+        job.setup = "Downloading GGUF weights"
         job.setup_at = time.time()
         job.push(force=True)
-        with contextlib.suppress(Exception):
-            job.cover_seconds = ART.draw(art_model_path(), spec["cover"],
-                                         PENDING_COVER, seed=int(spec["seed"]))["seconds"]
-            job.cover_ready = PENDING_COVER.is_file()
-        job.setup = ""
-        job.setup_at = None
-        job.push(force=True)
+        SONG.download_weights(weights["main"], weights["vae"])
+    job.setup = "Starting audio.cpp"
+    job.setup_at = time.time()
+    job.push(force=True)
+
+    work = OUTPUTS / (".pending-" + job.id)
+    work.mkdir(parents=True, exist_ok=True)
+    score = None
+    if spec.get("abc"):
+        score = work / "score.abc"
+        score.write_text(spec["abc"], encoding="utf-8")
+    stages = _GgufStages(job, spec.get("cot", "full"), bool(spec.get("abc")))
+    try:
+        try:
+            run = SONG.generate(spec, weights, work / "audio.wav", on_phase=stages.on_phase,
+                                cancelled=job.cancel_flag.is_set, abc_file=score)
+        except AudioCppError as exc:
+            if is_oom(exc) and weights["main"] != "q4_0":
+                raise RuntimeError(
+                    "Ran out of VRAM in audio.cpp. The smaller weights are the fix here: "
+                    "%s needs about %.1f GiB, q4_0 about 7.8 GiB. Original error: %s"
+                    % (weights["main"], _vram_hint(weights["main"]), exc)) from exc
+            raise
+        stages.finish()
+        # audio.cpp does not hand back the score it wrote, so a take only keeps
+        # one when the score came from here.
+        return GgufSong(spec, run["wav"], run["timing"], spec.get("abc") or "",
+                        dict(weights, exe=status["exe"], model_dir=status["models_dir"]))
+    finally:
+        if not (work / "audio.wav").is_file():
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def render_torch(job, spec):
+    """The in-process PyTorch pipeline: BF16 weights held in VRAM between runs."""
+    from yue2.protocol import GenerationConfig
 
     if ENGINE.pipe is None:
         # Model resolution happens before the progress reporter is swapped in.
@@ -442,7 +628,7 @@ def run_job(job):
         )
 
     try:
-        result = render()
+        return render()
     except Exception as exc:
         if is_oom(exc) and not job.cancel_flag.is_set():
             # The protocol pins the acoustic context to 24576, so there is no
@@ -455,6 +641,40 @@ def run_job(job):
                 "Original error: " + str(exc)) from exc
         raise
 
+
+def run_job(job):
+    job.state = "running"
+    job.started = time.time()
+    job.last_progress = time.time()
+    CURRENT["job"] = job
+    job.push(force=True)
+    ENGINE.status = "busy"
+    BUS.publish("engine", ENGINE.describe())
+    spec = job.spec
+
+    if SETTINGS.art_auto and ART.exe() is not None and art_model_path():
+        # The GPU is free right now; once YuE2 loads it is busy for minutes. A
+        # hand-written song has no cover line, so one is worked out here.
+        job.setup = "Writing the cover prompt" if not spec.get("cover") else "Drawing the cover"
+        job.setup_at = time.time()
+        job.push(force=True)
+        with contextlib.suppress(Exception):
+            prompt = cover_prompt_for(spec["style"], spec.get("lyrics", ""), spec.get("cover", ""))
+            spec["cover"] = prompt
+            job.setup = "Drawing the cover"
+            job.push(force=True)
+            job.cover_seconds = ART.draw(art_model_path(), prompt,
+                                         PENDING_COVER, seed=int(spec["seed"]))["seconds"]
+            job.cover_ready = PENDING_COVER.is_file()
+        job.setup = ""
+        job.setup_at = None
+        job.push(force=True)
+
+    if SETTINGS.song_engine == "gguf":
+        result = render_gguf(job, spec)
+    else:
+        result = render_torch(job, spec)
+
     folder = time.strftime("%Y%m%d-%H%M%S") + "-" + spec.get("id", "song")
     directory = OUTPUTS / folder
     summary = result.save_artifacts(directory)
@@ -465,6 +685,9 @@ def run_job(job):
             "timing": summary["timing"], "identity": summary["identity"],
             "cover_prompt": spec.get("cover", ""),
             "vae": SETTINGS.vae, "backend": SETTINGS.backend,
+            "engine": SETTINGS.song_engine,
+            "weights": summary.get("weights", {}),
+            "loras": [dict(entry) for entry in (SETTINGS.loras or [])],
             "provided_score": bool(spec.get("abc"))}
     (directory / "webui.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     if PENDING_COVER.is_file():
@@ -510,6 +733,7 @@ def worker():
                 with contextlib.suppress(Exception):
                     del ENGINE.pipe._status
             # Hand the VRAM back before the next run, however this one ended.
+            CURRENT["job"] = None
             ENGINE.park()
             ENGINE.status = "idle"
             BUS.publish("engine", ENGINE.describe())
@@ -517,7 +741,40 @@ def worker():
             WORK.task_done()
 
 
+def watchdog():
+    """Cut a run that has stopped making progress.
+
+    A CUDA job that wedges does not raise: it sits at full utilisation and
+    reports nothing, which is indistinguishable from slow work until you know
+    how long the stage should take. Rather than let it hold the card forever,
+    warn at half the limit and cancel at it.
+    """
+    while True:
+        time.sleep(10)
+        limit = int(SETTINGS.stall_timeout or 0)
+        if limit <= 0:
+            continue
+        job = CURRENT.get("job")
+        if job is None or job.state != "running" or job.cancel_flag.is_set():
+            continue
+        idle = time.time() - job.last_progress
+        if idle >= limit:
+            job.stalled = True
+            job.error = ("No progress for %d seconds, so the run was cancelled. On Windows this "
+                         "is usually the driver spilling VRAM into system RAM: the GPU sits at "
+                         "100%% while barely advancing. Set 'CUDA - Sysmem Fallback Policy' to "
+                         "'Prefer No Sysmem Fallback' in the NVIDIA Control Panel so it fails "
+                         "fast instead." % int(idle))
+            job.push(force=True)
+            job.cancel_flag.set()
+        elif idle >= limit / 2 and not job.stalled:
+            # Not cancelling yet, but say something: silence reads as normal.
+            BUS.publish("job", dict(job.snapshot(), warning=
+                        "No progress for %d seconds." % int(idle)))
+
+
 threading.Thread(target=worker, daemon=True, name="yue2-worker").start()
+threading.Thread(target=watchdog, daemon=True, name="yue2-watchdog").start()
 
 
 # ----------------------------------------------------------------------------- muse
@@ -676,14 +933,30 @@ THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # so the sibling module
 from llamacpp import LlamaCpp  # noqa: E402  imports however the app is launched
 from sdcpp import StableDiffusionCpp  # noqa: E402
+from audiocpp import MAIN_WEIGHTS as GGUF_WEIGHTS, AudioCpp, AudioCppError  # noqa: E402
+from loras import Loras  # noqa: E402
+from network import COOKIE, HEADER, Gate, new_pin  # noqa: E402
+import align as aligner  # noqa: E402
 
 LLAMA = LlamaCpp(ROOT, on_event=BUS.publish)
+LORAS = Loras(ROOT)
+GATE = Gate()
+if BIND_HOST not in LOOPBACK:
+    # Whatever started the app -- start.ps1, uvicorn by hand -- a console on the
+    # network has a PIN before it answers its first request.
+    if not SETTINGS.access_pin:
+        SETTINGS.access_pin = new_pin()
+        save_settings()
+    GATE.pin = SETTINGS.access_pin
 ART = StableDiffusionCpp(ROOT, on_event=BUS.publish)
+SONG = AudioCpp(ROOT, on_event=BUS.publish)
+SONG.override = SETTINGS.audiocpp_bin
 
 
 def sync_model_dirs():
     LLAMA.extra_dirs = list(SETTINGS.writer_dirs or [])
     ART.extra_dirs = list(SETTINGS.art_dirs or [])
+    LORAS.extra_dirs = list(SETTINGS.lora_dirs or [])
 
 
 def writer_backend():
@@ -720,6 +993,51 @@ def _art_request():
     except Exception:
         style = "natural"
     return "\n\n" + ART_GUIDANCE.get(style, ART_GUIDANCE["natural"])
+
+
+VOCABULARY_FILE = Path(__file__).resolve().parent / "vocabulary.json"
+VOCABULARY = json.loads(VOCABULARY_FILE.read_text(encoding="utf-8")) if VOCABULARY_FILE.is_file() else {"order": [], "fields": {}}
+
+
+def clean_sheet(sheet):
+    """Keep the choices that are in the vocabulary, in the vocabulary's order."""
+    given = {str(k): str(v).strip() for k, v in (sheet or {}).items() if str(v).strip()}
+    chosen = {}
+    for name in VOCABULARY.get("order", []):
+        value = given.get(name)
+        if value and value in VOCABULARY["fields"][name]["options"]:
+            chosen[name] = value
+    return chosen
+
+
+def style_from_sheet(sheet):
+    """The musical half of the sheet, as a style prompt fragment."""
+    chosen = clean_sheet(sheet)
+    parts = [chosen[name] for name in VOCABULARY.get("order", [])
+             if name in chosen and VOCABULARY["fields"][name]["goes_to"] == "style"]
+    return ", ".join(parts)
+
+
+def _sheet_request(sheet):
+    """Turn the picked fields into instructions the writer can follow."""
+    chosen = clean_sheet(sheet)
+    if not chosen:
+        return ""
+    lines = ["\n\nThe song sheet is already decided. Honour every line of it:"]
+    for name, value in chosen.items():
+        field = VOCABULARY["fields"][name]
+        lines.append("- %s: %s" % (field["label"], value))
+    if "lyrics" in chosen and chosen["lyrics"] == "instrumental":
+        lines.append("Write no sung words at all: section tags only, each one instrumental.")
+    elif "lyrics" in chosen and chosen["lyrics"] == "only voice - no words":
+        lines.append("Write wordless vocals: vowels and syllables under the tags, no real words.")
+    elif "lyrics" in chosen and chosen["lyrics"] == "sparse":
+        lines.append("Keep the words sparse: a handful of short lines, plenty of instrumental room.")
+    if "language" in chosen and not chosen["language"].startswith(("English", "No lyrics")):
+        lines.append("Write the lyrics in that language, and keep the section tags in English.")
+    lines.append("Name the genre, tempo, key, meter and voice in the style prompt too, "
+                 "in that order, before the instrument and production words.")
+    return "\n".join(lines)
 
 
 def _structure_request(structure):
@@ -900,11 +1218,14 @@ def read_take(directory):
         "truncated": result.get("truncated", {}),
         "identity": result.get("identity", ""),
         "vae": meta.get("vae", "standard"),
+        "engine": meta.get("engine", "torch"),
+        "loras": meta.get("loras", []),
         "provided_score": meta.get("provided_score", False),
         "cover_prompt": meta.get("cover_prompt", ""),
         "score": score,
         "e2e_seconds": timing.get("e2e_seconds"),
         "has_audio": (directory / "audio.flac").is_file(),
+        "has_timing": (directory / aligner.TIMING_FILE).is_file(),
         "has_cover": (directory / "cover.png").is_file(),
     }
 
@@ -949,6 +1270,7 @@ class GenerateBody(BaseModel):
 
 class MuseBody(BaseModel):
     idea: str
+    sheet: dict = Field(default_factory=dict)
     backend: str | None = None
     model: str | None = None
     free_engine: bool | None = None
@@ -961,9 +1283,20 @@ class SettingsBody(BaseModel):
     device: str | None = None
     backend: str | None = None
     quantization: str | None = None
+    song_engine: str | None = None
+    gguf_main: str | None = None
+    gguf_vae: str | None = None
+    gguf_backend: str | None = None
+    gguf_threads: int | None = None
+    audiocpp_bin: str | None = None
+    align_model: str | None = None
+    lan_access: bool | None = None
+    loras: list[dict] | None = None
+    lora_dirs: list[str] | None = None
     memory_budget_gib: float | None = None
     offload_ar: bool | None = None
     ode_steps: int | None = None
+    ode_method: str | None = None
     offline: bool | None = None
     ollama_url: str | None = None
     muse_model: str | None = None
@@ -973,6 +1306,7 @@ class SettingsBody(BaseModel):
     llamacpp_gpu_layers: int | None = None
     art_model: str | None = None
     art_auto: bool | None = None
+    stall_timeout: int | None = None
     writer_dirs: list[str] | None = None
     art_dirs: list[str] | None = None
 
@@ -1006,6 +1340,7 @@ def state():
             "vram": vram(), "budget_gib": resolved_budget(),
             "bundled_weights": (BUNDLED / "YuE2-3B" / "config.json").is_file(),
             "defaults": defaults_payload(), "outputs": str(OUTPUTS),
+            "song_engine": SONG.status(SETTINGS.gguf_main, SETTINGS.gguf_vae),
             "jobs": [JOBS[j].snapshot() for j in JOB_ORDER[-12:]]}
 
 
@@ -1070,14 +1405,21 @@ def api_settings(body: SettingsBody):
         raise HTTPException(409, "Finish or cancel the current run before changing the engine")
     # Only weights and compute settings invalidate a loaded pipeline; the writer
     # settings do not, so changing them must not cost a model reload.
-    for key in ("writer_dirs", "art_dirs"):
+    for key in ("writer_dirs", "art_dirs", "lora_dirs"):
         value = getattr(body, key)
         if value is not None:
             setattr(SETTINGS, key, [str(v) for v in value if str(v).strip()])
             save_settings()
             sync_model_dirs()
-    engine_keys = {"model", "vae", "device", "backend", "quantization",
-                   "memory_budget_gib", "offload_ar", "ode_steps", "offline"}
+    if body.ode_method is not None:
+        from yue2.protocol import ODE_METHODS
+        if body.ode_method not in ODE_METHODS:
+            raise HTTPException(400, "The acoustic solver must be one of " + ", ".join(ODE_METHODS))
+    if body.song_engine is not None and body.song_engine not in {"torch", "gguf"}:
+        raise HTTPException(400, "The song engine must be torch or gguf")
+    # Adapters are merged into the weights at load, so changing them reloads.
+    engine_keys = {"model", "vae", "device", "backend", "quantization", "song_engine",
+                   "memory_budget_gib", "offload_ar", "ode_steps", "ode_method", "offline", "loras"}
     changed, reload_needed = False, False
     for key, value in body.model_dump(exclude_none=True).items():
         if getattr(SETTINGS, key) != value:
@@ -1086,6 +1428,7 @@ def api_settings(body: SettingsBody):
             reload_needed = reload_needed or key in engine_keys
     if changed:
         save_settings()
+        SONG.override = SETTINGS.audiocpp_bin
     if reload_needed:
         ENGINE.unload()
         BUS.publish("engine", ENGINE.describe())
@@ -1096,6 +1439,11 @@ def api_settings(body: SettingsBody):
 def api_load():
     if ENGINE.status in {"busy", "loading"}:
         raise HTTPException(409, "The engine is already working")
+    if SETTINGS.song_engine == "gguf":
+        # audio.cpp holds the weights only for the length of a take, so there is
+        # nothing to preload and loading the PyTorch pipeline would take the VRAM.
+        raise HTTPException(409, "The GGUF engine loads its weights per take; there is "
+                                 "nothing to preload")
 
     def go():
         try:
@@ -1126,7 +1474,8 @@ def api_muse(body: MuseBody):
 
     backend = (body.backend or writer_backend()).lower()
     messages = [{"role": "system", "content": MUSE_SYSTEM},
-                {"role": "user", "content": "Idea: " + idea + _structure_request(body.structure) +
+                {"role": "user", "content": "Idea: " + idea + _sheet_request(body.sheet) +
+                                            _structure_request(body.structure) +
                                             _art_request()}]
 
     free_engine = SETTINGS.muse_free_engine if body.free_engine is None else body.free_engine
@@ -1197,7 +1546,7 @@ def api_muse(body: MuseBody):
                  "lines": len(sung), "freed_engine": freed}, **extra)
 
 
-def _muse_ollama(messages, requested):
+def _muse_ollama(messages, requested, schema=None):
     listing = ollama_models()
     if not listing["available"]:
         raise HTTPException(502, "Ollama is not answering at " + SETTINGS.ollama_url +
@@ -1206,7 +1555,7 @@ def _muse_ollama(messages, requested):
     if not model:
         raise HTTPException(400, "No Ollama model is installed - pull one first")
 
-    payload = {"model": model, "stream": False, "keep_alive": 0, "format": MUSE_SCHEMA,
+    payload = {"model": model, "stream": False, "keep_alive": 0, "format": schema or MUSE_SCHEMA,
                "options": {"temperature": 0.9, "top_p": 0.95, "num_ctx": 8192, "num_predict": 4096},
                "messages": messages}
     try:
@@ -1228,7 +1577,7 @@ def _muse_ollama(messages, requested):
                             "done_reason": response.get("done_reason")}
 
 
-def _muse_llamacpp(messages):
+def _muse_llamacpp(messages, schema=None):
     if LLAMA.server_exe() is None:
         raise HTTPException(501, "llama.cpp is not installed yet - install it under Engine")
     path = llamacpp_model_path()
@@ -1236,7 +1585,7 @@ def _muse_llamacpp(messages):
         raise HTTPException(400, "No writer model downloaded yet - pick one under Engine")
     try:
         LLAMA.start(path, gpu_layers=SETTINGS.llamacpp_gpu_layers)
-        content, usage = LLAMA.chat(messages, schema=MUSE_SCHEMA)
+        content, usage = LLAMA.chat(messages, schema=schema or MUSE_SCHEMA)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1306,6 +1655,152 @@ def api_llamacpp_model_delete(filename: str):
         SETTINGS.llamacpp_model = ""
         save_settings()
     BUS.publish("writer", {"busy": "", "deleted": filename})
+    return {"ok": True}
+
+
+@app.get("/api/vocabulary")
+def api_vocabulary():
+    return VOCABULARY
+
+
+class SheetBody(BaseModel):
+    sheet: dict = Field(default_factory=dict)
+
+
+@app.post("/api/sheet/style")
+def api_sheet_style(body: SheetBody):
+    """What the picked fields contribute to a style prompt, for the style box."""
+    return {"style": style_from_sheet(body.sheet), "chosen": clean_sheet(body.sheet)}
+
+
+ALIGNING = {"take": "", "busy": "", "error": ""}
+
+
+@app.get("/api/library/{name}/timing")
+def api_timing(name: str):
+    timing = aligner.read_timing(take_dir(name))
+    if timing is None:
+        raise HTTPException(404, "The words of this take have not been timed yet")
+    return timing
+
+
+@app.post("/api/library/{name}/timing")
+def api_align(name: str):
+    """Listen to the take and note when each line is sung."""
+    directory = take_dir(name)
+    if ALIGNING["busy"]:
+        raise HTTPException(409, "Already timing " + (ALIGNING["take"] or "a take"))
+    if ENGINE.status in {"busy", "loading"}:
+        raise HTTPException(409, "The song model is working; wait for the run to finish")
+    take = read_take(directory)
+    lyrics = (take or {}).get("lyrics", "")
+    if not lyrics.strip():
+        raise HTTPException(400, "This take has no lyrics to line up")
+
+    def go():
+        ALIGNING.update(take=name, busy="starting", error="")
+        BUS.publish("timing", dict(ALIGNING))
+
+        def progress(message):
+            ALIGNING["busy"] = message
+            BUS.publish("timing", dict(ALIGNING))
+
+        try:
+            result = aligner.align_take(directory, lyrics, model_id=SETTINGS.align_model,
+                                        progress=progress)
+            ALIGNING.update(busy="", error="")
+            BUS.publish("timing", dict(ALIGNING, done=True, take=name,
+                                       matched=result["lines_matched"], total=result["lines_total"]))
+            BUS.publish("library", {"reason": "timing", "take": name})
+        except Exception as exc:
+            ALIGNING.update(busy="", error="%s: %s" % (type(exc).__name__, exc))
+            BUS.publish("timing", dict(ALIGNING, done=True))
+
+    threading.Thread(target=go, daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/api/loras")
+def api_loras():
+    sync_model_dirs()
+    return LORAS.status(SETTINGS.loras)
+
+
+class LoraBody(BaseModel):
+    loras: list[dict]
+
+
+@app.post("/api/loras")
+def api_loras_select(body: LoraBody):
+    sync_model_dirs()
+    known = {entry["path"] for entry in LORAS.discover()}
+    chosen = []
+    for entry in body.loras:
+        path = str(Path(str(entry.get("path", ""))).resolve())
+        if path not in known:
+            raise HTTPException(404, "That adapter is not in a folder the console scans")
+        strength = float(entry.get("strength", 1.0))
+        if not -4 <= strength <= 4:
+            raise HTTPException(400, "Adapter strength must be between -4 and 4")
+        chosen.append({"path": path, "strength": strength})
+    changed = chosen != list(SETTINGS.loras or [])
+    if changed:
+        SETTINGS.loras = chosen
+        save_settings()
+        # The adapters are folded into the weights, so the loaded model is stale.
+        ENGINE.unload()
+        BUS.publish("engine", ENGINE.describe())
+    return {"selected": SETTINGS.loras, "reloaded": changed}
+
+
+@app.get("/api/song-engine/status")
+def api_song_engine_status():
+    return dict(SONG.status(SETTINGS.gguf_main, SETTINGS.gguf_vae),
+                engine=SETTINGS.song_engine, selected_main=SETTINGS.gguf_main,
+                selected_vae=SETTINGS.gguf_vae, compute=SETTINGS.gguf_backend,
+                threads=SETTINGS.gguf_threads)
+
+
+@app.post("/api/song-engine/install")
+def api_song_engine_install():
+    if SONG.busy:
+        raise HTTPException(409, "Already busy: " + SONG.busy)
+
+    def go():
+        try:
+            result = SONG.install()
+            BUS.publish("song_engine", {"busy": "", "installed": True, **result})
+        except Exception as exc:
+            BUS.publish("song_engine", {"busy": "", "error": "%s: %s" % (type(exc).__name__, exc)})
+
+    threading.Thread(target=go, daemon=True).start()
+    return {"started": True}
+
+
+@app.post("/api/song-engine/weights")
+def api_song_engine_weights(main: str = Form(None), vae: str = Form(None)):
+    if SONG.busy:
+        raise HTTPException(409, "Already busy: " + SONG.busy)
+    main_id, vae_id = main or SETTINGS.gguf_main, vae or SETTINGS.gguf_vae
+
+    def go():
+        try:
+            result = SONG.download_weights(main_id, vae_id)
+            BUS.publish("song_engine", {"busy": "", "downloaded": result["main"]})
+        except Exception as exc:
+            BUS.publish("song_engine", {"busy": "", "error": "%s: %s" % (type(exc).__name__, exc)})
+
+    threading.Thread(target=go, daemon=True).start()
+    return {"started": True}
+
+
+@app.delete("/api/song-engine/weights/{filename}")
+def api_song_engine_weights_delete(filename: str):
+    try:
+        SONG.delete_weight(filename)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    BUS.publish("song_engine", {"busy": "", "deleted": filename})
     return {"ok": True}
 
 
@@ -1470,6 +1965,48 @@ def art_model_path():
     return ART.resolve_choice(SETTINGS.art_model)
 
 
+COVER_ONLY_SCHEMA = {
+    "type": "object",
+    "properties": {"cover": {"type": "string", "description":
+                   "The album cover as a picture: subject, setting, light, colour palette "
+                   "and art style. Never mention instruments, genre, tempo or the title, "
+                   "and never ask for text or lettering in the image"}},
+    "required": ["cover"],
+}
+
+
+def cover_prompt_for(style, lyrics="", supplied="", allow_writer=True):
+    """What to draw for a song.
+
+    A brief written by the console already carries a cover line. Lyrics typed by
+    hand do not, so ask the writer for one -- it costs a few seconds in the
+    window where the GPU is idle anyway. If no writer is set up, fall back to the
+    genre and mood words in the style prompt, which is thin but always available.
+    """
+    if supplied:
+        return supplied
+    # The caller decides whether a writer may run: inside a job the engine is
+    # marked busy from the first line, even though YuE2 has not loaded yet, so
+    # its status is the wrong thing to ask.
+    with contextlib.suppress(Exception):
+        if allow_writer:
+            messages = [
+                {"role": "system", "content":
+                 "You turn a song into a single album-cover image description. Answer with "
+                 "JSON only."},
+                {"role": "user", "content":
+                 "Style: " + style + "\n\nLyrics:\n" + lyrics[:1200] + _art_request()},
+            ]
+            if writer_backend() == "llamacpp":
+                content, _, _ = _muse_llamacpp(messages, schema=COVER_ONLY_SCHEMA)
+            else:
+                content, _, _ = _muse_ollama(messages, None, schema=COVER_ONLY_SCHEMA)
+            line = json.loads(_strip_thinking(content)).get("cover", "").strip()
+            if line:
+                return line
+    return visual_from_style(style)
+
+
 def draw_cover(take_name, seed=-1):
     """Draw a sleeve for one take from its own style prompt and title."""
     directory = take_dir(take_name)
@@ -1481,12 +2018,20 @@ def draw_cover(take_name, seed=-1):
     path = art_model_path()
     if not path:
         raise HTTPException(400, "No art model downloaded yet - pick one under Engine")
-    # A style prompt is a track sheet -- instruments and BPM -- which makes a poor
-    # picture. Prefer the visual line the writer produced for this song.
-    prompt = take.get("cover_prompt") or visual_from_style(take["style"])
+    # Free the card before anything else runs on it: working out the prompt may
+    # start a writer, and drawing needs room after that.
     ENGINE.park()
+    # A style prompt is a track sheet -- instruments and BPM -- which makes a poor
+    # picture, so a visual line is used or written instead.
+    prompt = cover_prompt_for(take["style"], take.get("lyrics", ""), take.get("cover_prompt", ""))
     result = ART.draw(path, prompt, directory / "cover.png",
                       seed=take["seed"] if seed == -1 and take["seed"] else seed)
+    meta_file = directory / "webui.json"
+    if meta_file.is_file():
+        with contextlib.suppress(Exception):
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            meta["cover_prompt"] = prompt
+            meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     BUS.publish("library", {"reason": "cover", "name": take_name})
     return dict(result, take=take_name, prompt=prompt)
 
@@ -1548,15 +2093,93 @@ async def api_events(cursor: int = 0):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# Open so a phone can load the console far enough to ask for the PIN.
+OPEN_PATHS = {"/", "/m", "/api/unlock", "/favicon.ico"}
+
+
+@app.middleware("http")
+async def guard(request, call_next):
+    """Everything but the page itself needs the PIN, unless it is this machine."""
+    path = request.url.path
+    client = request.client.host if request.client else ""
+    if not GATE.required(client) or path in OPEN_PATHS or path.startswith("/static/"):
+        return await call_next(request)
+    offered = (request.headers.get(HEADER) or request.query_params.get("k")
+               or request.cookies.get(COOKIE) or "")
+    if GATE.check(client, offered):
+        return await call_next(request)
+    if offered:
+        GATE.note_failure(client)
+    wait = GATE.blocked_for(client)
+    detail = ("Too many wrong PINs; try again in %d seconds" % wait if wait
+              else "This console needs its PIN when it is reached over the network")
+    return JSONResponse({"detail": detail, "pin_required": True}, status_code=401)
+
+
+class UnlockBody(BaseModel):
+    pin: str
+
+
+@app.post("/api/unlock")
+def api_unlock(body: UnlockBody, request: Request):
+    client = request.client.host if request.client else ""
+    if not GATE.required(client):
+        return {"ok": True, "needed": False}
+    wait = GATE.blocked_for(client)
+    if wait:
+        raise HTTPException(429, "Too many wrong PINs; try again in %d seconds" % wait)
+    if not GATE.check(client, body.pin.strip()):
+        GATE.note_failure(client)
+        raise HTTPException(401, "Wrong PIN")
+    response = JSONResponse({"ok": True, "needed": True})
+    # A cookie rather than a header, so audio and artwork elements carry it too.
+    response.set_cookie(COOKIE, GATE.pin, max_age=60 * 60 * 24 * 30, samesite="lax", httponly=False)
+    return response
+
+
+@app.get("/api/network")
+def api_network(request: Request):
+    client = request.client.host if request.client else ""
+    # The PIN itself is only ever shown to the machine the console runs on.
+    described = GATE.describe(BIND_PORT, reveal=not GATE.required(client))
+    return dict(described, on_network=BIND_HOST not in LOOPBACK, host=BIND_HOST,
+                wanted=bool(SETTINGS.lan_access), forced=bool(os.environ.get("YUE2_HOST")),
+                this_client=client)
+
+
+PHONE = re.compile(r"iPhone|iPod|Android.*Mobile|Windows Phone|BlackBerry", re.I)
+
+
+def _page(name, request, key):
+    """Serve a page with its assets versioned, so an edited console never loads
+    against a browser-cached script from an earlier build."""
+    html = (STATIC / name).read_text(encoding="utf-8")
+    assets = ("app.js", "app.css") if name == "index.html" else ("mobile.js", "mobile.css")
+    stamp = str(max(int((STATIC / asset).stat().st_mtime) for asset in assets))
+    for asset in assets:
+        html = html.replace("/static/" + asset, "/static/%s?v=%s" % (asset, stamp))
+    response = HTMLResponse(html, headers={"Cache-Control": "no-store, must-revalidate"})
+    client = request.client.host if request.client else ""
+    if GATE.required(client) and key and GATE.check(client, key):
+        response.set_cookie(COOKIE, GATE.pin, max_age=60 * 60 * 24 * 30, samesite="lax", httponly=False)
+    return response
+
+
+@app.get("/m", response_class=HTMLResponse)
+def mobile(request: Request, k: str = ""):
+    """The phone console: two screens, one player, no knobs."""
+    return _page("mobile.html", request, k)
+
+
 @app.get("/", response_class=HTMLResponse)
-def index():
-    """Serve the page with its assets versioned, so an edited console never
-    loads against a browser-cached script from an earlier build."""
-    html = (STATIC / "index.html").read_text(encoding="utf-8")
-    stamp = str(max(int((STATIC / name).stat().st_mtime) for name in ("app.js", "app.css")))
-    html = html.replace("/static/app.js", "/static/app.js?v=" + stamp)
-    html = html.replace("/static/app.css", "/static/app.css?v=" + stamp)
-    return HTMLResponse(html, headers={"Cache-Control": "no-store, must-revalidate"})
+def index(request: Request, k: str = "", desktop: int = 0):
+    """The full console, or the phone one when a phone asks for it."""
+    agent = request.headers.get("user-agent", "")
+    if not desktop and PHONE.search(agent):
+        # A phone lands on the phone console; ?desktop=1 overrides for good.
+        target = "/m?k=" + quote(k) if k else "/m"
+        return RedirectResponse(target, status_code=302)
+    return _page("index.html", request, k)
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -1564,9 +2187,14 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 def main():
     import uvicorn
-    host = os.environ.get("YUE2_HOST", "127.0.0.1")
-    port = int(os.environ.get("YUE2_PORT", "7865"))
-    print("YuE2 Console  ->  http://%s:%d" % (host, port), file=sys.stderr, flush=True)
+    host, port = BIND_HOST, BIND_PORT
+    if host not in LOOPBACK:
+        print("YuE2 Console  ->  http://%s:%d" % (host, port), file=sys.stderr, flush=True)
+        for url in GATE.describe(port)["urls"]:
+            print("  on this network:  %s?k=%s" % (url, GATE.pin), file=sys.stderr, flush=True)
+        print("  PIN %s  (Engine -> Phone access shows it again)" % GATE.pin, file=sys.stderr, flush=True)
+    else:
+        print("YuE2 Console  ->  http://%s:%d" % (host, port), file=sys.stderr, flush=True)
     uvicorn.run(app, host=host, port=port, log_level=os.environ.get("YUE2_LOG", "info"),
                 access_log=True)
 

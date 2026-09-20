@@ -7,12 +7,42 @@
     return fetch(path, options).then(function (r) {
       if (!r.ok) {
         return r.json().catch(function () { return {}; }).then(function (body) {
+          // Reached over the network without the PIN: ask for it rather than
+          // leaving the page looking broken.
+          if (r.status === 401 && body.pin_required) askForPin(body.detail);
           throw new Error(body.detail || (r.status + " " + r.statusText));
         });
       }
       return r.status === 204 ? null : r.json();
     });
   };
+
+  function askForPin(detail) {
+    var gate = $("pinGate");
+    if (!gate || gate.dataset.open === "1") return;
+    gate.dataset.open = "1";
+    gate.classList.remove("is-hidden");
+    if (detail) $("pinHint").textContent = detail;
+    $("pinInput").focus();
+  }
+
+  function submitPin() {
+    var pin = $("pinInput").value.trim();
+    if (!pin) return;
+    $("pinHint").textContent = "checking…";
+    fetch("/api/unlock", { method: "POST", headers: { "Content-Type": "application/json" },
+                           body: JSON.stringify({ pin: pin }) })
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().catch(function () { return {}; }).then(function (body) {
+            throw new Error(body.detail || "Wrong PIN");
+          });
+        }
+        // The cookie is set; everything the page asks for from here carries it.
+        window.location.reload();
+      })
+      .catch(function (error) { $("pinHint").textContent = error.message; });
+  }
 
   var STATE = {
     defaults: null,
@@ -356,6 +386,127 @@
     try { localStorage.setItem("yue2.autorun", this.checked ? "1" : "0"); } catch (error) {}
   });
 
+  /* ------------------------------------------------------- phone access */
+
+  $("pinForm").addEventListener("submit", function (event) { event.preventDefault(); submitPin(); });
+
+  function paintNetwork(data) {
+    var on = data.on_network;
+    $("netState").textContent = on ? "on this network"
+      : (data.wanted ? "restart to switch on" : "this machine only");
+    $("netState").dataset.s = on ? "ready" : (data.wanted ? "busy" : "missing");
+    if (!on) {
+      $("netUrls").innerHTML = '<p class="hint">Bound to ' + escape(data.host) +
+        ", so only this machine can reach it. " + (data.wanted
+          ? "The setting above is on — <b>close the console and start it again</b> and it will answer on your network."
+          : "Tick the box above, then start the console again.") + "</p>";
+      return;
+    }
+    if (!data.urls.length) {
+      $("netUrls").innerHTML = '<p class="hint">No network address found yet.</p>';
+      return;
+    }
+    $("netUrls").innerHTML = data.urls.map(function (url, index) {
+      var full = data.pin ? url + "?k=" + encodeURIComponent(data.pin) : url;
+      // The first address is the one the routing table would actually use; the
+      // others are usually a virtual switch or a VPN and reach no phone.
+      var note = index === 0
+        ? (data.pin ? "try this one first — it carries the PIN" : "try this one first")
+        : "another interface on this machine; probably not the one your phone is on";
+      return '<div class="model-row' + (index === 0 ? " is-installed" : "") + '"><div><strong>' +
+        escape(url) + "</strong><small>" + note + "</small></div>" +
+        '<button type="button" class="btn ghost small" data-copy="' + escape(full) + '">Copy link</button></div>';
+    }).join("") + (data.pin
+      ? '<p class="row-hint">PIN <b class="mono">' + escape(data.pin) + "</b> — the link carries it, " +
+        "or type it once on the phone.</p>"
+      : "") + (data.firewall
+      ? '<p class="row-hint">If the phone cannot reach it at all, Windows Firewall is blocking the port. ' +
+        'Run this once in an <b>administrator</b> PowerShell:</p>' +
+        '<div class="model-row"><div><strong class="mono wrap">' + escape(data.firewall) +
+        "</strong><small>allows the port for your own subnet only</small></div>" +
+        '<button type="button" class="btn ghost small" data-copy="' + escape(data.firewall) + '">Copy</button></div>'
+      : "");
+  }
+
+  $("netUrls").addEventListener("click", function (event) {
+    var button = event.target.closest("[data-copy]");
+    if (!button) return;
+    var text = button.dataset.copy;
+    var done = function () { toast("Link copied"); };
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, function () { window.prompt("Copy this", text); });
+    else window.prompt("Copy this", text);
+  });
+
+  function refreshNetwork() {
+    return api("/api/network").then(paintNetwork).catch(function () {});
+  }
+
+  /* --------------------------------------------------------- song sheet */
+
+  var SHEET_NONE = "";
+
+  function sheetValues() {
+    var chosen = {};
+    Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
+      if (select.value) chosen[select.dataset.sheet] = select.value;
+    });
+    return chosen;
+  }
+
+  function paintSheetCount() {
+    var count = Object.keys(sheetValues()).length;
+    $("sheetCount").textContent = count ? count + (count === 1 ? " field set" : " fields set") : "nothing picked";
+    $("sheetCount").dataset.on = count ? "1" : "0";
+    try { localStorage.setItem("yue2.sheet", JSON.stringify(sheetValues())); } catch (error) {}
+  }
+
+  function buildSheet(vocabulary) {
+    STATE.vocabulary = vocabulary;
+    var saved = {};
+    try { saved = JSON.parse(localStorage.getItem("yue2.sheet") || "{}"); } catch (error) {}
+    $("sheetGrid").innerHTML = vocabulary.order.map(function (name) {
+      var field = vocabulary.fields[name];
+      var options = ['<option value="' + SHEET_NONE + '">let the writer decide</option>'].concat(
+        field.options.map(function (value) {
+          return '<option value="' + escape(value) + '">' + escape(value) + "</option>";
+        })).join("");
+      return '<label class="field"><span class="label">' + escape(field.label) +
+        (field.hint ? "<em>" + escape(field.hint) + "</em>" : "") + "</span>" +
+        '<select data-sheet="' + name + '">' + options + "</select></label>";
+    }).join("");
+    Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
+      var name = select.dataset.sheet;
+      if (saved[name] && vocabulary.fields[name].options.indexOf(saved[name]) >= 0) {
+        select.value = saved[name];
+      }
+      select.addEventListener("change", paintSheetCount);
+    });
+    paintSheetCount();
+  }
+
+  $("sheetToStyle").addEventListener("click", function () {
+    api("/api/sheet/style", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sheet: sheetValues() })
+    }).then(function (data) {
+      if (!data.style) return toast("Nothing musical picked yet", "bad");
+      var current = $("style").value.trim();
+      $("style").value = current ? data.style + ", " + current : data.style;
+      toast("Style prompt updated");
+    }).catch(function (error) { toast(error.message, "bad"); });
+  });
+
+  $("sheetClear").addEventListener("click", function () {
+    Array.prototype.forEach.call(document.querySelectorAll("[data-sheet]"), function (select) {
+      select.value = SHEET_NONE;
+    });
+    paintSheetCount();
+  });
+
+  api("/api/vocabulary").then(function (data) {
+    if (data && data.order && data.order.length) buildSheet(data);
+  }).catch(function () {});
+
   function writeBrief() {
     var idea = $("idea").value.trim();
     if (!idea) { $("idea").focus(); return toast("Describe the song in a line first", "bad"); }
@@ -374,7 +525,8 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ idea: idea, model: $("museModel").value,
                              free_engine: $("museFree").checked,
-                             structure: $("structure").value })
+                             structure: $("structure").value,
+                             sheet: sheetValues() })
     }).then(function (brief) {
       if (brief.title) $("title").value = brief.title;
       if (brief.style) $("style").value = brief.style;
@@ -609,8 +761,16 @@
     $("takeEyebrow").textContent = job.setup ? job.setup : (stateLabels[job.state] || job.state);
     $("takeTitle").textContent = job.title;
 
-    $("runError").classList.toggle("is-hidden", !job.error);
-    $("runError").textContent = job.error || "";
+    // A run that has gone quiet looks identical to one that is working hard, so
+    // say how long it has been silent before the watchdog acts.
+    var quiet = job.state === "running" && (job.idle_seconds || 0) > 60;
+    var message = job.error || (quiet
+      ? "No progress for " + clock(job.idle_seconds) + ". Long songs are slow, but a run "
+        + "that stays silent will be cancelled automatically."
+      : "");
+    $("runError").classList.toggle("is-hidden", !message);
+    $("runError").classList.toggle("warn-only", !job.error && !!message);
+    $("runError").textContent = message;
 
     var finished = job.state !== "running" && job.state !== "queued";
     var html = "";
@@ -1025,6 +1185,10 @@
     var canvas = $("viz");
     var analyser = VIZ.analyser;
     if (!analyser || audio.paused) { VIZ.frame = 0; return; }
+    if (document.hidden) {
+      VIZ.frame = requestAnimationFrame(function () { setTimeout(drawViz, 250); });
+      return;
+    }
 
     var width = canvas.clientWidth, height = canvas.clientHeight;
     if (!width || !height) { VIZ.frame = requestAnimationFrame(drawViz); return; }
@@ -1118,6 +1282,8 @@
   /* The sleeve exists minutes before the audio does, so it carries the wait:
      a slow sweep across the picture and a ring that fills with the run. */
 
+  var RUN_FRAME_MS = 80;      // ~12 fps while a song is being generated
+
   var RUN_VIZ = {
     frame: 0, phase: 0,
     build: 0, buildTarget: 0,     // rows revealed outward from the centre
@@ -1138,6 +1304,10 @@
   function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
 
   function drawRunViz() {
+    if (document.hidden) {          // an unseen tab must not cost the GPU a thing
+      RUN_VIZ.frame = requestAnimationFrame(function () { setTimeout(drawRunViz, 500); });
+      return;
+    }
     var canvas = $("viz");
     var width = canvas.clientWidth, height = canvas.clientHeight;
     if (!width || !height) { RUN_VIZ.frame = requestAnimationFrame(drawRunViz); return; }
@@ -1238,7 +1408,11 @@
     ctx.arc(cx, cy, ringRadius * 0.94, lead, lead + 0.45);
     ctx.stroke();
 
-    RUN_VIZ.frame = requestAnimationFrame(drawRunViz);
+    // Throttled on purpose: the card is busy generating, and a full-rate canvas
+    // loop competes with the desktop compositor for it.
+    RUN_VIZ.frame = requestAnimationFrame(function () {
+      setTimeout(drawRunViz, RUN_FRAME_MS);
+    });
   }
 
   function startRunViz(build, refine) {
@@ -1479,9 +1653,14 @@
     ["setModel", "model", "text"], ["setVae", "vae", "text"], ["setDevice", "device", "text"],
     ["setBackend", "backend", "text"], ["setQuant", "quantization", "text"],
     ["setBudget", "memory_budget_gib", "number"], ["setOde", "ode_steps", "int"],
+    ["setOdeMethod", "ode_method", "text"],
     ["setOffload", "offload_ar", "bool"], ["setOffline", "offline", "bool"],
     ["setOllama", "ollama_url", "text"], ["setMuseModel", "muse_model", "text"],
-    ["setMuseFree", "muse_free_engine", "bool"]
+    ["setMuseFree", "muse_free_engine", "bool"],
+    ["setLanAccess", "lan_access", "bool"],
+    ["setSongEngine", "song_engine", "text"], ["setGgufMain", "gguf_main", "text"],
+    ["setGgufVae", "gguf_vae", "text"], ["setGgufBackend", "gguf_backend", "text"],
+    ["setGgufThreads", "gguf_threads", "int"], ["setAudiocppBin", "audiocpp_bin", "text"]
   ];
 
   function paintSettings(settings) {
@@ -1491,7 +1670,142 @@
       if (field[2] === "bool") el.checked = !!settings[field[1]];
       else el.value = settings[field[1]];
     });
+    $("paneGguf").classList.toggle("is-dim", settings.song_engine !== "gguf");
+    $("paneLoras").classList.toggle("is-dim", settings.song_engine === "gguf");
+    $("preloadBtn").disabled = settings.song_engine === "gguf";
   }
+
+  /* ----------------------------------------------------------- adapters */
+
+  function paintLoras(data) {
+    STATE.loras = data;
+    var active = (data.selected || []).length;
+    $("loraState").textContent = active ? active + " active" : "none active";
+    $("loraState").dataset.s = active ? "ready" : "missing";
+    $("loraDirs").textContent = (data.dirs && data.dirs.length)
+      ? "Scanning: " + data.models_dir + "  ·  " + data.dirs.join("  ·  ")
+      : "Scanning " + data.models_dir + " — add your ComfyUI loras folder to see more.";
+
+    var chosen = {};
+    (data.selected || []).forEach(function (entry) { chosen[entry.path] = entry.strength; });
+    if (!data.available.length) {
+      $("loraList").innerHTML = '<p class="hint">No YuE2 adapters found in those folders.</p>';
+      return;
+    }
+    $("loraList").innerHTML = data.available.map(function (entry) {
+      var on = Object.prototype.hasOwnProperty.call(chosen, entry.path);
+      var strength = on ? chosen[entry.path] : 1;
+      return '<div class="model-row' + (on ? " is-installed" : "") + '">' +
+        "<div><strong>" + escape(entry.file) + "</strong><small>" + entry.branch + " · " +
+        entry.layers + " layers · rank " + entry.ranks.join("/") + " · " + escape(entry.source) +
+        "</small></div>" +
+        '<span class="size">' + entry.size_mb + " MB</span>" +
+        '<input class="lora-strength" type="number" step="0.05" min="-4" max="4" value="' + strength +
+        '" data-strength="' + escape(entry.path) + '"' + (on ? "" : " disabled") + " />" +
+        '<button type="button" class="btn ghost small" data-lora="' + escape(entry.path) + '">' +
+        (on ? "Remove" : "Use") + "</button></div>";
+    }).join("");
+  }
+
+  function refreshLoras() {
+    return api("/api/loras").then(paintLoras).catch(function () {});
+  }
+
+  function saveLoras(selected) {
+    return api("/api/loras", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ loras: selected })
+    }).then(function (data) {
+      toast(data.reloaded ? "Adapters saved — the model reloads on the next run" : "No change");
+      return refreshLoras();
+    }).catch(function (error) { toast(error.message, "bad"); });
+  }
+
+  $("loraList").addEventListener("click", function (event) {
+    var button = event.target.closest("[data-lora]");
+    if (!button) return;
+    var path = button.dataset.lora;
+    var selected = ((STATE.loras || {}).selected || []).slice();
+    var at = -1;
+    selected.forEach(function (entry, index) { if (entry.path === path) at = index; });
+    if (at >= 0) selected.splice(at, 1);
+    else selected.push({ path: path, strength: 1 });
+    saveLoras(selected);
+  });
+
+  $("loraList").addEventListener("change", function (event) {
+    var input = event.target.closest("[data-strength]");
+    if (!input) return;
+    var selected = ((STATE.loras || {}).selected || []).map(function (entry) {
+      return entry.path === input.dataset.strength
+        ? { path: entry.path, strength: parseFloat(input.value) }
+        : entry;
+    });
+    saveLoras(selected);
+  });
+
+  $("loraDirAdd").addEventListener("click", function () {
+    addDir("loraDir", "lora_dirs", (STATE.loras || {}).dirs, refreshLoras);
+  });
+
+  /* ------------------------------------------------------- the song engine */
+
+  function paintSongEngine(data) {
+    STATE.songEngine = data;
+    var ready = data.installed && data.yue2;
+    $("ggufState").textContent = data.busy ? "working"
+      : (ready ? "ready" : (data.installed ? "no YuE2 in this build" : "not installed"));
+    $("ggufState").dataset.s = data.busy ? "busy" : (ready ? "ready" : "missing");
+    $("ggufInstall").textContent = data.installed ? "Reinstall audio.cpp" : "Install audio.cpp";
+    $("ggufInstall").disabled = !!data.busy || !data.supported;
+    if (!data.supported) {
+      $("ggufHint").textContent = "The one-click audio.cpp install here covers 64-bit Windows only; " +
+        "build it yourself and give the path below.";
+    }
+    $("ggufWeightsHint").textContent = data.weights_ready
+      ? "Weights are in " + data.models_dir
+      : "Missing: " + data.missing.join("  ·  ") + " — they download on the first run.";
+
+    var rows = data.main.concat(data.vae);
+    $("ggufCatalog").innerHTML = rows.map(function (entry) {
+      var action = entry.installed
+        ? '<button type="button" class="btn ghost small" data-drop-gguf="' + escape(entry.file) + '">Remove</button>'
+        : '<button type="button" class="btn ghost small" data-get-gguf="' + escape(entry.id) + '"' +
+          (data.busy ? " disabled" : "") + ">Download</button>";
+      var vram = entry.vram_gib ? " · about " + entry.vram_gib + " GiB of VRAM" : "";
+      return '<div class="model-row' + (entry.installed ? " is-installed" : "") + '">' +
+        "<div><strong>" + escape(entry.file) + "</strong><small>" + escape(entry.note) + vram + "</small></div>" +
+        '<span class="size">' + entry.size_gb + " GB</span>" + action + "</div>";
+    }).join("");
+  }
+
+  function refreshSongEngine() {
+    return api("/api/song-engine/status").then(paintSongEngine).catch(function () {});
+  }
+
+  $("ggufInstall").addEventListener("click", function () {
+    api("/api/song-engine/install", { method: "POST" })
+      .then(function () { toast("Looking for an audio.cpp build that carries YuE2"); })
+      .catch(function (error) { toast(error.message, "bad"); });
+  });
+
+  $("ggufCatalog").addEventListener("click", function (event) {
+    var get = event.target.closest("[data-get-gguf]");
+    var drop = event.target.closest("[data-drop-gguf]");
+    if (get) {
+      var body = new FormData();
+      var id = get.dataset.getGguf;
+      body.append(id === "f16" || id === "f32" ? "vae" : "main", id);
+      api("/api/song-engine/weights", { method: "POST", body: body })
+        .then(function () { toast("Downloading the GGUF weights"); })
+        .catch(function (error) { toast(error.message, "bad"); });
+    } else if (drop) {
+      if (!window.confirm("Delete this GGUF file?")) return;
+      api("/api/song-engine/weights/" + encodeURIComponent(drop.dataset.dropGguf), { method: "DELETE" })
+        .then(function () { toast("GGUF file deleted"); return refreshSongEngine(); })
+        .catch(function (error) { toast(error.message, "bad"); });
+    }
+  });
 
   $("saveSettings").addEventListener("click", function () {
     var body = {};
@@ -1508,6 +1822,8 @@
       body: JSON.stringify(body)
     }).then(function (data) {
       paintSettings(data.settings);
+      refreshSongEngine();
+      refreshNetwork();
       $("museModel").value = data.settings.muse_model || $("museModel").value;
       $("museFree").checked = !!data.settings.muse_free_engine;
       toast(data.reloaded ? "Saved — the song model reloads on the next run"
@@ -1534,6 +1850,7 @@
 
   function resync() {
     return api("/api/state").then(function (data) {
+      if (data.song_engine) paintSongEngine(data.song_engine);
       paintEngine(data.engine);
       paintHardware(data.hardware);
       paintVram(data.vram);
@@ -1557,6 +1874,12 @@
       if (data.error) toast(data.error, "bad");
       if (data.busy) $("artState").textContent = data.busy;
       if (!data.busy) refreshArt();
+    });
+    source.addEventListener("song_engine", function (event) {
+      var data = JSON.parse(event.data);
+      if (data.error) { toast(data.error, "bad"); }
+      if (data.busy) { $("ggufState").textContent = data.busy; }
+      if (!data.busy) { refreshSongEngine(); }
     });
     source.addEventListener("writer", function (event) {
       var data = JSON.parse(event.data);
@@ -1594,6 +1917,9 @@
   }).catch(function (error) { toast("Could not reach the server: " + error.message, "bad"); });
 
   api("/api/examples").then(function (data) { STATE.examples = data; }).catch(function () {});
+  refreshSongEngine();
+  refreshLoras();
+  refreshNetwork();
   refreshLibrary().catch(function () {});
   refreshMuse();
   refreshCover();

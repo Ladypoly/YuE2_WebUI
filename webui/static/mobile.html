@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en" data-theme="studio">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#14110e" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>YuE2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" />
+<link rel="stylesheet" href="/static/mobile.css" />
+</head>
+<body>
+
+<!-- The shell is a flex column the height of the screen: the middle scrolls,
+     the bar below it does not move. No fixed positioning is involved. -->
+
+<!-- ------------------------------------------------------------- pin gate -->
+<div class="pin-gate" id="pinGate" hidden>
+  <form class="pin-card" id="pinForm">
+    <h2>Console PIN</h2>
+    <p class="note" id="pinHint">This console asks for its PIN over the network.</p>
+    <input type="text" id="pinInput" inputmode="numeric" maxlength="6" placeholder="000000" />
+    <button type="submit" class="btn primary">Unlock</button>
+  </form>
+</div>
+
+<main class="main" id="main">
+
+  <!-- -------------------------------------------------------------- create -->
+  <section class="screen is-on" id="screen-create">
+    <h1>Write a song</h1>
+
+    <div class="switch" role="group" aria-label="How to describe the song">
+      <button type="button" id="modeSimple" aria-pressed="true">Simple</button>
+      <button type="button" id="modeCustom" aria-pressed="false">Custom</button>
+    </div>
+
+    <div id="paneSimple">
+      <label class="f"><span>Your idea</span>
+        <input type="text" id="idea" autocomplete="off"
+               placeholder="a slow song about missing the last train home" /></label>
+      <p class="note">A local writer turns this into a title, a style and the words, then the
+        song is made.</p>
+    </div>
+
+    <div id="paneCustom" hidden>
+      <label class="f"><span>Title</span>
+        <input type="text" id="title" autocomplete="off" placeholder="City Lights" /></label>
+      <label class="f"><span>Style</span>
+        <textarea id="style" rows="3" placeholder="English, warm piano pop, expressive female voice, unhurried phrasing, 88 BPM"></textarea></label>
+      <label class="f"><span>Lyrics</span>
+        <textarea id="lyrics" rows="10" spellcheck="false" placeholder="[Verse]&#10;Neon fades along the lane&#10;&#10;[Chorus]&#10;Let the day come into view"></textarea></label>
+    </div>
+
+    <h2>Song sheet</h2>
+    <p class="note" id="sheetNote">Optional. Whatever you set here is honoured; the rest is left open.</p>
+    <div id="sheetGroups"></div>
+    <div class="sheet-actions">
+      <button type="button" class="btn quiet" id="sheetClear">Clear sheet</button>
+      <button type="button" class="btn quiet" id="sheetToStyle" hidden>Add to style</button>
+    </div>
+
+    <button type="button" class="btn primary" id="go">Write and make the song</button>
+    <p class="note" id="engineNote"></p>
+
+    <div class="run" id="run" hidden>
+      <div class="run-head">
+        <strong id="runTitle">Working</strong>
+        <span class="when" id="runClock"></span>
+      </div>
+      <ul class="steps" id="runSteps"></ul>
+      <div class="bar"><i id="runBar" style="width:0%"></i></div>
+      <button type="button" class="btn quiet" id="cancel">Stop</button>
+    </div>
+
+    <div class="foot"><a href="/?desktop=1">Full console</a></div>
+  </section>
+
+  <!-- -------------------------------------------------------------- listen -->
+  <section class="screen" id="screen-listen">
+    <h1>Your songs</h1>
+    <p class="note">Tap a song to play it, or its sleeve for everything about it.</p>
+    <div class="takes" id="takes"></div>
+    <p class="note" id="takesEmpty" hidden>Nothing here yet. Write one on the other tab.</p>
+    <div class="foot"><a href="/?desktop=1">Full console</a></div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- song -->
+  <section class="screen" id="screen-song">
+    <button type="button" class="back" id="songBack" aria-label="Back to the list">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      <span>Songs</span>
+    </button>
+
+    <div class="sleeve" id="sleeve">
+      <img id="songArt" alt="" hidden />
+      <div class="noart" id="songNoArt">♪</div>
+      <div class="karaoke" id="karaoke" hidden>
+        <div class="karaoke-lines" id="karaokeLines"></div>
+      </div>
+      <button type="button" class="sleeve-key" id="karaokeToggle" aria-pressed="false">Words</button>
+    </div>
+
+    <h1 id="songTitle">—</h1>
+    <p class="meta" id="songMeta"></p>
+
+    <canvas class="viz" id="viz" height="120"></canvas>
+
+    <div class="song-keys">
+      <button type="button" class="btn primary" id="songPlay">Play</button>
+      <button type="button" class="btn" id="songSave">Save on this device</button>
+      <a class="btn" id="songDownload" download hidden>Download the file</a>
+      <button type="button" class="btn" id="songSync" data-done="0">Time the words to the song</button>
+    </div>
+    <p class="note" id="songSaveNote"></p>
+    <p class="note" id="songSyncNote"></p>
+
+    <h2>Style prompt</h2>
+    <p class="prompt" id="songStyle"></p>
+
+    <h2>Lyrics</h2>
+    <pre class="prompt" id="songLyrics"></pre>
+
+    <div id="songCoverWrap" hidden>
+      <h2>Cover prompt</h2>
+      <p class="prompt" id="songCover"></p>
+    </div>
+
+  </section>
+
+</main>
+
+<!-- ----------------------------------------------------------- now playing -->
+<div class="now" id="now" hidden>
+  <div class="seek" id="seek" role="slider" aria-label="Seek" tabindex="0">
+    <i id="seekFill" style="width:0%"></i><b id="seekKnob" style="left:0%"></b>
+  </div>
+  <div class="now-row">
+    <img id="nowArt" alt="" hidden />
+    <div class="noart" id="nowNoArt">♪</div>
+    <div class="who">
+      <strong id="nowTitle">Nothing playing</strong>
+      <small id="nowStyle"></small>
+    </div>
+    <div class="times"><span id="nowTime">0:00</span><span id="nowLeft"></span></div>
+    <!-- The glyph is chosen by CSS from data-playing: setting .hidden on an
+         <svg> is not honoured everywhere, an attribute selector always is. -->
+    <button type="button" id="playPause" class="play" data-playing="0" aria-label="Play or pause">
+      <svg viewBox="0 0 24 24" class="glyph-play" aria-hidden="true"><path d="M8 5.5v13l11-6.5z" fill="currentColor" stroke="none"/></svg>
+      <svg viewBox="0 0 24 24" class="glyph-pause" aria-hidden="true"><path d="M8.5 5.5v13M15.5 5.5v13" stroke-width="2.6"/></svg>
+    </button>
+  </div>
+</div>
+
+<!-- ------------------------------------------------------------------- bar -->
+<nav class="bar-nav">
+  <button type="button" id="tabCreate" aria-selected="true" aria-label="Create">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19.5 8.5a2.5 2.5 0 0 0-3.5-3.5L4.5 16.5V20z"/><path d="M14.5 6.5l3 3"/></svg>
+  </button>
+  <button type="button" id="tabListen" aria-selected="false" aria-label="Listen">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V6.5l10-2V16"/><circle cx="6.5" cy="18" r="2.6"/><circle cx="16.5" cy="16" r="2.6"/></svg>
+  </button>
+</nav>
+
+<div class="toast" id="toast"></div>
+<audio id="audio" preload="none"></audio>
+
+<script src="/static/mobile.js"></script>
+</body>
+</html>

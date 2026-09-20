@@ -712,6 +712,46 @@ pre.paper { font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; word-br
   .topbar { flex-wrap: wrap; height: auto; padding: 10px 14px; gap: 12px; }
 }
 
+/* A phone: one column, thumb-sized controls, nothing pinned that would eat the
+   screen. The tablet rules above already stack the workspace. */
+@media (max-width: 620px) {
+  .topbar { padding: 8px 10px; gap: 8px; }
+  .brand h1 { font-size: 18px; }
+  .engine-chip { flex: 1 1 100%; order: 3; }
+  .head-actions { margin-left: auto; }
+  .head-actions .btn { padding: 8px 10px; }
+  .col { padding: 12px 12px 40px; gap: 12px; }
+  .col-head { margin: -12px -12px 0; padding: 12px 12px 10px; }
+  .engine-grid { grid-template-columns: 1fr; }
+  .field-row { flex-direction: column; align-items: stretch; }
+  .seedfield { width: auto; }
+  .sheet-grid { grid-template-columns: 1fr; }
+  .library { max-height: none; }
+  .model-row { flex-wrap: wrap; }
+  /* Tap targets: a phone needs a finger's worth of height on anything live. */
+  .btn, select, input[type="text"], input[type="number"] { min-height: 40px; font-size: 15px; }
+  textarea { font-size: 15px; }
+  .playbar { position: sticky; bottom: 0; }
+  .muse-row { flex-direction: column; align-items: stretch; }
+}
+
+/* The PIN the console asks for when it is reached over the network. */
+.pin-gate {
+  position: fixed; inset: 0; z-index: 90;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; background: rgba(12, 11, 9, .93);
+}
+.pin-gate.is-hidden { display: none; }
+.pin-card {
+  width: min(360px, 100%); display: flex; flex-direction: column; gap: 12px;
+  padding: 22px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--ground);
+}
+.pin-card h2 { margin: 0; font-size: 18px; }
+.pin-card input {
+  font-family: var(--mono); font-size: 26px; letter-spacing: .34em; text-align: center;
+  padding: 12px; min-height: 48px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
@@ -764,6 +804,26 @@ pre.paper { font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; word-br
 .model-row small { display: block; font-size: 11px; color: var(--dim); }
 .model-row .size { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .model-row.is-installed { border-color: var(--patina-dim); }
+
+/* four short fields sit on one line on a wide card and wrap on a laptop */
+#paneGguf .field-row { flex-wrap: wrap; }
+.model-row .wrap { white-space: normal; word-break: break-all; font-size: 11px; line-height: 1.5; }
+.lora-strength { width: 68px; font-family: var(--mono); font-size: 11.5px; }
+
+/* the song sheet: nine short pickers that fold away when not in use */
+.sheet { margin: 4px 0 2px; border: 1px solid var(--line-soft); border-radius: var(--r-md); background: var(--sunk); }
+.sheet > summary { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer;
+                   font-size: 12.5px; font-weight: 500; list-style: none; }
+.sheet > summary::-webkit-details-marker { display: none; }
+.sheet > summary::before { content: "▸"; color: var(--muted); font-size: 10px; }
+.sheet[open] > summary::before { content: "▾"; }
+.sheet-count { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.sheet-count[data-on="1"] { color: var(--patina); }
+.sheet .hint { margin: 0 12px 10px; }
+.sheet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; padding: 0 12px 10px; }
+.sheet-grid select { max-width: 100%; }
+.sheet-foot { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 12px 12px; }
+#paneGguf .field-row .field { min-width: 150px; flex: 1; }
 
 .writer-progress {
   font-family: var(--mono);
@@ -1080,3 +1140,10 @@ textarea:hover::-webkit-scrollbar-thumb {
   box-shadow: inset 2px 0 0 var(--amber);
 }
 .take.is-running-row .take-title { color: var(--amber); }
+
+/* A quiet run is a warning, not yet a failure. */
+.run-error.warn-only {
+  background: rgba(232, 163, 61, .07);
+  border-color: var(--amber-dim);
+  color: var(--amber);
+}
