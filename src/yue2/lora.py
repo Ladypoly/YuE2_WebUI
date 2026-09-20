@@ -170,5 +170,117 @@ def _merge_one(model, path, strength, device):
             "branches": sorted({branch for branch, _, _ in pairs})}
 
 
+# audio.cpp reads the same adapter, but only in the checkpoint's own layout:
+# separate projections named lora_A/lora_B, and the latent projections as whole
+# tensors rather than deltas. It refuses a ComfyUI file by name rather than
+# guessing, so the fused one is taken apart here instead.
+AUDIOCPP_PROJECTIONS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                        "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+LATENT = ("vae2llm.weight", "vae2llm.bias", "llm2vae.weight", "llm2vae.bias")
+
+
+def convert_for_audiocpp(adapter_path, model_dir, destination):
+    """Rewrite a ComfyUI NAR adapter into the unfused file audio.cpp accepts.
+
+    The split follows the checkpoint's real widths, exactly as the merge does.
+    The latent projections arrive as deltas and have to leave as whole tensors,
+    so the base weights are read and added; audio.cpp applies those unscaled,
+    which is the one place a strength other than 1.0 would not carry over.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    adapter_path, destination = Path(adapter_path), Path(destination)
+    state = {}
+    with safe_open(str(adapter_path), framework="pt") as handle:
+        for key in handle.keys():
+            state[key] = handle.get_tensor(key)
+
+    weights = Path(model_dir) / "model.safetensors"
+    if not weights.is_file():
+        raise LoraError("The base weights are needed to convert the latent projections: " + str(weights))
+
+    out, layers = {}, set()
+    with safe_open(str(weights), framework="pt") as base:
+        available = set(base.keys())
+
+        def width(name):
+            return base.get_slice(name).get_shape()[0]
+
+        for key, value in state.items():
+            layer = LAYER.fullmatch(key)
+            direct = DIRECT.fullmatch(key)
+            if layer is not None:
+                branch, index, target, half = layer.group(1), int(layer.group(2)), layer.group(3), layer.group(4)
+                if not BRANCHES[branch]:
+                    raise LoraError("Only NAR adapters convert for audio.cpp today: " + key)
+                if half != "lora_up":
+                    continue                      # the pair is handled from its up half
+                down = state.get(key.replace("lora_up", "lora_down"))
+                if down is None:
+                    raise LoraError("Adapter entry is missing its other half: " + key)
+                names = FUSED.get(target, (target,))
+                modules = ["model.layers.%d.nar_%s.weight" % (index, name) for name in names]
+                if any(name not in available for name in modules):
+                    raise LoraError("This checkpoint has no " + modules[0])
+                widths = [width(name) for name in modules]
+                if sum(widths) != value.shape[0]:
+                    raise LoraError("Fused adapter for %s covers %d rows, this checkpoint needs %d"
+                                    % (target, value.shape[0], sum(widths)))
+                rank, spare = divmod(value.shape[1], len(names))
+                if spare:
+                    raise LoraError("Fused adapter for %s has rank %d, which does not divide by %d"
+                                    % (target, value.shape[1], len(names)))
+                # Splitting is only lossless when the fusion is block-diagonal,
+                # which is how these adapters are trained and packaged. A file
+                # that shares its ranks across the projections cannot be taken
+                # apart at all, so say so rather than convert it wrongly.
+                if len(names) > 1:
+                    offset = 0
+                    for position, rows in enumerate(widths):
+                        block = value[offset:offset + rows]
+                        outside = torch.cat([block[:, :position * rank],
+                                             block[:, (position + 1) * rank:]], dim=1)
+                        if outside.numel() and float(outside.abs().max()) > 0:
+                            raise LoraError(
+                                "Fused adapter for %s shares ranks across its projections, so it "
+                                "cannot be split for audio.cpp; merge it with the PyTorch engine "
+                                "instead" % target)
+                        offset += rows
+                offset = 0
+                for position, (name, rows) in enumerate(zip(names, widths)):
+                    columns = slice(position * rank, (position + 1) * rank)
+                    prefix = "layers.%d.nar_%s" % (index, name)
+                    out[prefix + ".lora_A"] = down[columns].contiguous()
+                    out[prefix + ".lora_B"] = value[offset:offset + rows, columns].contiguous()
+                    offset += rows
+                layers.add(index)
+            elif direct is not None:
+                branch, name, kind = direct.groups()
+                target = name + (".weight" if kind == "diff" else ".bias")
+                if target not in available:
+                    raise LoraError("This checkpoint has no " + target)
+                whole = base.get_tensor(target).float() + value.float()
+                out[target] = whole.contiguous()
+            else:
+                raise LoraError("Unexpected key in " + adapter_path.name + ": " + key)
+
+    unknown = [name for name in out
+               if name not in LATENT
+               and not any(name.endswith(p + ".lora_A") or name.endswith(p + ".lora_B")
+                           for p in AUDIOCPP_PROJECTIONS)]
+    if unknown:
+        raise LoraError("Converted adapter has a name audio.cpp would refuse: " + unknown[0])
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    save_file(out, str(destination), metadata={
+        "yue2_lora_branch": "nar",
+        "converted_from": adapter_path.name,
+        "layout": "unfused lora_A/lora_B per projection; latent projections are whole tensors",
+    })
+    return {"path": str(destination), "tensors": len(out), "layers": len(layers),
+            "latent": sorted(name for name in out if name in LATENT)}
+
+
 def lora_status(model):
     return {"merged": list(getattr(model, "_yue2_loras", None) or [])}

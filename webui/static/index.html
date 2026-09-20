@@ -112,7 +112,8 @@
       <p class="hint">LoRA adapters change the acoustic half of the model — the part that turns the
         written score into sound — so they shape the voice and the mix, not the composition. They are
         merged into the weights when the model loads, which costs nothing per song but means a change
-        here reloads it. PyTorch engine only: audio.cpp reads GGUF weights and cannot take them.</p>
+        here reloads it. Both engines take them: audio.cpp wants the adapter unfused, so the console
+        converts it once and keeps the result beside the GGUF weights.</p>
 
       <div class="writer-pane" id="paneLoras">
         <div class="pane-head">

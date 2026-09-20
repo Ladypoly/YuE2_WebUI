@@ -51,6 +51,9 @@ SIDECARS = ["sidecars/yue2-model-config.json", "sidecars/yue2-generation-config.
 # Timing markers audio.cpp prints under --log. Most arrive as a phase ends, so
 # they move the console on to the next stage rather than fill a bar.
 TIMING = re.compile(r"^\[TIMING [^\]]*\]\s+(\S+)\s+(.*)$")
+# audio.cpp says what it loaded at Info level. Keeping the line is the only
+# evidence a finished take was really made with the adapter.
+ADAPTER = re.compile(r"(yue2\.(?:nar|ar)_lora):\s*(.+?),\s*projections=(\d+),\s*scale=([\d.]+)")
 PHASE_DONE = [
     ("yue2.semantic.abc_generated_tokens", "plan"),
     ("yue2.plan.abc_tokens", "plan"),
@@ -247,6 +250,34 @@ class AudioCpp:
 
     # ------------------------------------------------------------ generate
 
+    def adapter_dir(self):
+        return self.models_dir / "adapters"
+
+    def prepare_adapters(self, adapters, model_dir):
+        """audio.cpp takes the same adapter, in the checkpoint's own layout.
+
+        It refuses a ComfyUI file by name rather than guessing, so the fused one
+        is converted here, once, and kept beside the GGUF weights.
+        """
+        from yue2.lora import convert_for_audiocpp
+
+        prepared = []
+        for entry in adapters or []:
+            source = Path(entry["path"])
+            if not source.is_file():
+                raise AudioCppError("No adapter file at " + str(source))
+            target = self.adapter_dir() / (source.stem + ".audiocpp.safetensors")
+            if not target.is_file() or target.stat().st_mtime < source.stat().st_mtime:
+                self._say("converting " + source.name)
+                convert_for_audiocpp(source, model_dir, target)
+                self._say("")
+            prepared.append({"file": target.relative_to(self.models_dir).as_posix(),
+                             "strength": float(entry.get("strength", 1.0))})
+        if len(prepared) > 1:
+            raise AudioCppError("audio.cpp takes one NAR adapter at a time; "
+                                "leave one selected under Engine")
+        return prepared
+
     def _command(self, spec, settings, out_wav, abc_file):
         exe = self.cli_exe()
         if exe is None:
@@ -269,6 +300,9 @@ class AudioCpp:
                    "--request-option", "num_inference_steps=%d" % int(settings.get("ode_steps", 32)),
                    "--seed", str(int(spec.get("seed", 831001))),
                    "--out", str(out_wav), "--log"]
+        for adapter in settings.get("adapters") or []:
+            command += ["--session-option", "yue2.nar_lora=" + adapter["file"],
+                        "--session-option", "yue2.nar_lora_scale=%s" % adapter["strength"]]
         if spec.get("cfg_scale") is not None:
             command += ["--request-option", "cfg_scale=%s" % float(spec["cfg_scale"])]
         if abc_file is not None:
@@ -286,7 +320,7 @@ class AudioCpp:
         cancelled = cancelled or (lambda: False)
         command = self._command(spec, settings, out_wav, abc_file)
         started = time.perf_counter()
-        timings, tail = {}, []
+        timings, tail, loaded = {}, [], []
         with self.lock:
             self.process = subprocess.Popen(
                 command, cwd=str(self.cli_exe().parent), stdout=subprocess.PIPE,
@@ -311,6 +345,11 @@ class AudioCpp:
                 tail.append(line)
                 del tail[:-60]
                 self._observe(line, timings, on_phase)
+                found = ADAPTER.search(line)
+                if found:
+                    loaded.append({"option": found.group(1), "file": found.group(2).strip(),
+                                   "projections": int(found.group(3)),
+                                   "scale": float(found.group(4))})
             code = process.wait()
         finally:
             stop.set()
@@ -322,7 +361,7 @@ class AudioCpp:
             raise AudioCppError("audio.cpp could not finish this take (exit %s).\n%s"
                                 % (code, "\n".join(tail[-25:])))
         timings["e2e_seconds"] = time.perf_counter() - started
-        return {"wav": str(out_wav), "timing": timings}
+        return {"wav": str(out_wav), "timing": timings, "adapters_loaded": loaded}
 
     def _observe(self, line, timings, on_phase):
         match = TIMING.match(line)

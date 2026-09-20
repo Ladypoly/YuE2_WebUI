@@ -537,10 +537,6 @@ def render_gguf(job, spec):
     weights = {"main": SETTINGS.gguf_main, "vae": SETTINGS.gguf_vae,
                "backend": SETTINGS.gguf_backend, "threads": int(SETTINGS.gguf_threads),
                "ode_steps": int(SETTINGS.ode_steps)}
-    if SETTINGS.loras:
-        raise RuntimeError("audio.cpp loads GGUF weights and cannot merge adapters. "
-                           "Switch the song engine back to PyTorch to use them, or clear "
-                           "the adapter selection under Engine.")
     status = SONG.status(weights["main"], weights["vae"])
     if not status["installed"]:
         raise RuntimeError("The GGUF engine is selected but audio.cpp is not installed. "
@@ -553,6 +549,15 @@ def render_gguf(job, spec):
         job.setup_at = time.time()
         job.push(force=True)
         SONG.download_weights(weights["main"], weights["vae"])
+    adapters, missing = LORAS.resolve(SETTINGS.loras)
+    if missing:
+        raise RuntimeError("These adapters are no longer on disk: " + ", ".join(missing))
+    if adapters:
+        # The console's own adapter file is a ComfyUI one; audio.cpp wants it
+        # unfused, so it is converted once and kept beside the GGUF weights.
+        job.setup = "Preparing the adapter"
+        job.push(force=True)
+        weights["adapters"] = SONG.prepare_adapters(adapters, bundled_or_hub(SETTINGS.model))
     job.setup = "Starting audio.cpp"
     job.setup_at = time.time()
     job.push(force=True)
@@ -578,8 +583,10 @@ def render_gguf(job, spec):
         stages.finish()
         # audio.cpp does not hand back the score it wrote, so a take only keeps
         # one when the score came from here.
+        # What audio.cpp reported loading, not what we asked it to load.
         return GgufSong(spec, run["wav"], run["timing"], spec.get("abc") or "",
-                        dict(weights, exe=status["exe"], model_dir=status["models_dir"]))
+                        dict(weights, exe=status["exe"], model_dir=status["models_dir"],
+                             adapters_loaded=run.get("adapters_loaded") or []))
     finally:
         if not (work / "audio.wav").is_file():
             shutil.rmtree(work, ignore_errors=True)

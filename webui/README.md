@@ -284,9 +284,17 @@ widths, so a file that does not fit this model is refused instead of half-applie
 Only files whose header really carries adapter keys are offered, so an image LoRA
 sitting in the same folder is simply not listed.
 
-Adapters need the PyTorch engine. audio.cpp reads GGUF weights and cannot merge
-them, and a run is refused rather than quietly ignoring the selection. From the
-command line: `yue2 song --lora path	odapter.safetensors:0.8 ...`.
+Both engines take adapters. audio.cpp reads the same file but only in the
+checkpoint's own layout -- separate projections named `lora_A`/`lora_B`, and the
+latent projections as whole tensors rather than deltas -- and refuses a ComfyUI one
+by name rather than guessing at it. So the console converts the fused file once,
+keeps the result in `models/Yue2-3B-GGUF/adapters/`, and passes it as
+`yue2.nar_lora`. The split is the same arithmetic as the merge, checked exact to
+about 1e-10. One difference worth knowing: audio.cpp applies the latent projection
+replacements unscaled, so a strength other than 1.0 lands slightly differently
+across the two engines.
+
+From the command line: `yue2 song --lora path	odapter.safetensors:0.8 ...`.
 
 ## The song sheet
 
@@ -313,6 +321,7 @@ Two engines run the same model, chosen under **Engine -> Song engine**:
 | VRAM for one take | about 12.5 GiB | 7.8 GiB at q4_0, 8.9 at q8_0 |
 | Where it runs | in this process, weights stay in VRAM | its own process, VRAM handed back at the end |
 | Score written by the model | kept as `score.abc`, streamed while it writes | not returned by the CLI |
+| LoRA adapters | merged at load | converted once, passed as `yue2.nar_lora` |
 
 The VRAM figures are audio.cpp's own RTX 5090 measurements for a three-minute take;
 the quantized runs are also slightly faster there (0.199 RTF against 0.269). Neither
